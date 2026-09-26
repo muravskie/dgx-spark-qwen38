@@ -24,7 +24,9 @@ import shutil
 import sys
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve()
 DASH = HERE.parents[1]
@@ -100,6 +102,8 @@ class Base(unittest.TestCase):
         # and would then receive the TestCase as its first argument.
         cls.real_run = staticmethod(cls.cp.run)
         cls._real_run = cls.cp.run
+        cls._real_controller_27b = cls.cp.controller_27b
+        cls._real_image_snapshot = cls.cp.image_lab.snapshot
 
     @classmethod
     def tearDownClass(cls):
@@ -108,6 +112,15 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         self.cp.run = type(self)._real_run
+        self.cp.controller_27b = type(self)._real_controller_27b
+        self.cp.image_lab.snapshot = type(self)._real_image_snapshot
+
+    def setUp(self):
+        # Collector tests are hermetic even when the development box happens to
+        # run spark-model-controller on its real Unix socket.
+        self.cp.controller_27b = lambda: None
+        self.cp.image_lab.snapshot = lambda *_args: {"node_id": "local", "controller": None,
+                                                    "queue": None, "history": None}
 
     def box(self, table=None):
         fake = FakeBox(table)
@@ -121,6 +134,37 @@ class Base(unittest.TestCase):
 
 
 class Parse(Base):
+    def test_throughput_reads_engine_metrics_and_derives_rates(self):
+        metrics = ('sglang:gen_throughput{engine_type="unified"} 48.0\n'
+                   'sglang:realtime_tokens_total{mode="prefill_compute"} 1000\n'
+                   'sglang:realtime_tokens_total{mode="prefill_cache"} 5000\n'
+                   'sglang:realtime_tokens_total{mode="decode"} 700\n')
+        self.box()
+        self.cp.http_text = lambda *_args, **_kwargs: metrics
+        self.cp.THROUGHPUT.update(lane=None, ts=None, counters={}, recent=deque(maxlen=10))
+        first = self.cp.collect_throughput()
+        self.assertEqual(first["current"]["generation"], 48.0)
+        self.assertNotIn("prefill_compute", first["current"])
+        self.cp.THROUGHPUT["ts"] -= 2
+        second = self.cp.collect_throughput()
+        self.assertAlmostEqual(second["current"]["prefill_compute"], 0.0)
+        self.assertAlmostEqual(second["current"]["prefill_cache"], 0.0)
+
+    def test_throughput_median_ignores_idle_zero_rates(self):
+        metrics = ('sglang:gen_throughput{engine_type="unified"} 48.0\n'
+                   'sglang:realtime_tokens_total{mode="prefill_compute"} 1000\n')
+        self.cp.http_text = lambda *_args, **_kwargs: metrics
+        self.cp.THROUGHPUT.update(lane=None, ts=None, counters={}, recent=deque(maxlen=10))
+        self.cp.collect_throughput()
+        self.cp.THROUGHPUT["recent"].extend([
+            {"prefill_compute": 0.0, "generation": 0.0},
+            {"prefill_compute": 100.0, "generation": 40.0},
+            {"prefill_compute": 200.0, "generation": 50.0},
+        ])
+        out = self.cp.collect_throughput()
+        self.assertEqual(out["recent_median"]["prefill_compute"], 150.0)
+        self.assertEqual(out["recent_median"]["generation"], 48.0)
+
     def test_units_reads_systemctl_show(self):
         self.box({"systemctl show": fixture("systemctl-show.txt")})
         out = self.cp.collect_units()
@@ -136,6 +180,50 @@ class Parse(Base):
         out = self.cp.collect_units()
         for unit, got in out["units"].items():
             self.assertEqual(got["active"], "?", unit)
+
+    def test_units_reports_controller_owned_qwen_as_the_boot_owner(self):
+        self.box({})
+        self.cp.controller_27b = lambda: {
+            "id": "qwen3.8-27b", "ownership": "managed", "runtime": "running"
+        }
+        got = self.cp.collect_units()["units"]["qwen38-sglang.service"]
+        self.assertEqual(got["active"], "active")
+        self.assertEqual(got["enabled"], "enabled")
+        self.assertEqual(got["manager"], "spark-model-controller")
+
+    def test_lifecycle_uses_controller_owned_qwen_when_legacy_unit_is_inactive(self):
+        self.cp.controller_27b = lambda: {"id": "qwen3.8-27b", "ownership": "managed",
+                                          "runtime": "running", "healthy": True}
+        self.box({"systemctl show qwen38-sglang.service":
+                  "ActiveState=inactive\nSubState=dead\nActiveEnterTimestampMonotonic=0\n",
+                  "docker ps -q -f name=^qwen38-sglang$": "managed-container\n"})
+        with self.cp.STATE_LOCK:
+            previous = self.cp.STATE.get("engine_fast")
+            self.cp.STATE["engine_fast"] = {"data": {"healthy": True}}
+        try:
+            out = self.cp.collect_lifecycle()
+            self.assertEqual(out["engines"]["qwen38-sglang.service"]["state"], "ready")
+            self.assertFalse(any(o["unit"] == "qwen38-sglang.service" for o in out["orphans"]))
+            self.assertIn("switch", out["blocked"])
+        finally:
+            with self.cp.STATE_LOCK:
+                if previous is None:
+                    self.cp.STATE.pop("engine_fast", None)
+                else:
+                    self.cp.STATE["engine_fast"] = previous
+
+    def test_controller_owned_qwen_action_never_calls_legacy_systemd(self):
+        self.cp.controller_27b = lambda: {"id": "qwen3.8-27b", "ownership": "managed"}
+        calls = []
+        def controller(method, path, timeout):
+            calls.append((method, path))
+            return 200, {"ok": True}
+        job = self.cp.Job("unit", None, 90, params={"verb": "stop", "unit": "qwen38-sglang.service"})
+        with mock.patch.object(self.cp, "controller_request", side_effect=controller), \
+             mock.patch.object(self.cp.subprocess, "run", side_effect=AssertionError("legacy systemd called")):
+            ok, _, _ = self.cp.job_unit(job)
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("POST", "/v1/models/qwen3.8-27b/deactivate")])
 
     def test_containers_reads_ps_and_stats(self):
         self.box({"docker ps --format": fixture("docker-ps.txt"),
@@ -506,6 +594,7 @@ class TheBootBarNeverGoesBack(Base):
     U = "qwen38-sglang.service"
 
     def setUp(self):
+        super().setUp()
         self.cp.BOOT_SEEN.clear()
         with self.cp.STATE_LOCK:
             self.cp.STATE["engine_fast"] = {"data": {"healthy": False}}
@@ -630,6 +719,7 @@ class TheCockpitsOwnProbeIsNotAClient(Base):
             "#pending-token: 0, cuda graph: False, input throughput (token/s): 5210.40\n")
 
     def setUp(self):
+        super().setUp()
         self.cp.LAST_PROGRESS["ts"] = None
         self.cp.LAST_USAGE.update(value=0.93, mamba=0.2, ts=1.0)
 

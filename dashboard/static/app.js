@@ -442,6 +442,20 @@ function rDecode(d){
   setText('kvusage', t ? (100 * t.token_usage).toFixed(1) + ' %' : (u.tokens ? (100 * u.tokens).toFixed(0) + ' % (last seen)' : 'idle'));
   setText('mambausage', u.mamba ? (100 * u.mamba).toFixed(0) + ' %' + (u.mamba >= 0.5 ? ' (guard flushes when idle)' : '') : 'idle');
 }
+function rThroughput(d){
+  const c = d.current || {}, recent = d.recent_median || {};
+  const rate = key => c[key] == null ? 'idle' : `${c[key].toFixed(1)} tok/s`;
+  const med = key => recent[key] == null ? '' : `; median ${recent[key].toFixed(1)} over ${d.sample_count || 0} windows`;
+  const medianText = ['prefill_compute', 'prefill_cache', 'generation']
+    .filter(key => recent[key] != null)
+    .map(key => `${key === 'prefill_compute' ? 'pre' : key === 'prefill_cache' ? 'cache' : 'gen'} ${key === 'generation' ? recent[key].toFixed(1) : Math.round(recent[key])}`)
+    .join(' / ');
+  const wholeRate = key => c[key] == null ? 'idle' : `${Math.round(c[key])} tok/s`;
+  setShort('prefillrate', wholeRate('prefill_compute'), `Uncached prefill now${med('prefill_compute')}`);
+  setShort('cacherate', wholeRate('prefill_cache'), `Cached prompt processing now${med('prefill_cache')}`);
+  setShort('genrate', rate('generation'), `Generation now${med('generation')}`);
+  setShort('throughputmedian', medianText || 'warming up', 'Median over the last 10 telemetry windows, in tok/s');
+}
 function rCanary(d){
   let txt, cls = '', why = '';
   // With no text engine the probe has nothing to ask, and its last success, however old,
@@ -489,6 +503,7 @@ function unitRow(name){
 }
 function rUnits(d){
   F.units = d.units || {};
+  showUpdateProcedure();
   const sel = $('switchsel'); if (sel) markInstalled(sel);
   const shown = Object.entries(F.units).filter(([n]) => n.includes('keepalive'));
   UNIT_ROWS.forEach((r, n) => { if (!shown.some(([m]) => m === n)){ r.row.remove(); UNIT_ROWS.delete(n); } });
@@ -642,6 +657,18 @@ function rRepo(d){
     : 'clean');
   setText('proxyver', F.proxy && F.proxy.version ? F.proxy.version + (F.proxy.same_as_repo === false ? ' · deployed file differs from the repo copy' : ' · repo copy') : 'unknown');
 }
+const controllerOwnsQwen = () => F.units?.['qwen38-sglang.service']?.manager === 'spark-model-controller';
+function showUpdateProcedure(){
+  if (controllerOwnsQwen()){
+    setText('update-head', 'Update Cockpit');
+    setText('update-note', 'The model controller owns Qwen and ComfyUI. This dashboard installer refreshes Cockpit without taking over either model container. Serving-stack updates need a controller-aware review.');
+    setText('updatecmd', `cd ${(F.config || {}).repo_dir || '<repo>'} && ./dashboard/install-dashboard.sh`);
+  } else {
+    setText('update-head', 'Update the serving stack');
+    setText('update-note', 'The installer needs an interactive sudo, so it is a terminal command. It keeps the chosen model, context mode, port and opencode setting.');
+    setText('updatecmd', ((F.config || {}).terminal_only || {}).update_stack || 'cd <repo> && ./install.sh');
+  }
+}
 function rConfig(d){
   F.config = d; F.usable = d.usable_frac || F.usable;
   setText('ckver', d.version || '?'); $('verbadge').textContent = (d.version || '').includes('beta') ? 'BETA' : 'v' + (d.version || '');
@@ -653,7 +680,7 @@ function rConfig(d){
   const per = d.periods || {}, pv = Object.values(per);
   setShort('ckperiods', pv.length ? `${pv.length} collectors, ${Math.min(...pv)} s to ${Math.max(...pv)} s` : '...',
            Object.entries(per).map(([k, v]) => `${k} ${v} s`).join(', '));
-  setText('updatecmd', (d.terminal_only || {}).update_stack || 'cd <repo> && ./install.sh');
+  showUpdateProcedure();
 }
 
 // ── lifecycle: engine cards (updated in place), lane pill, events, badges ─────
@@ -1245,17 +1272,24 @@ $('agrestart').addEventListener('click', () => askAction('unit', {verb: 'restart
 function rUpdate(d){
   F.update = d || {};
   const parts = [];
-  if (d.installed) parts.push(d.installed);
+  const sourceCurrent = controllerOwnsQwen() && /^\d+\.\d+\.\d+$/.test(F.config?.version || '')
+    && /^v?\d+\.\d+\.\d+$/.test(d.latest || '')
+    && verCmp(F.config.version, d.latest.replace(/^v/, '')) >= 0;
+  if (sourceCurrent) parts.push(`v${F.config.version} checkout`);
+  else if (d.installed) parts.push(d.installed);
   if (d.checked === false) parts.push('update check off (COCKPIT_UPDATE_CHECK=0)');
   else if (!d.latest) parts.push('latest release unknown (no network, or GitHub unreachable)');
-  else if (d.behind) parts.push(`${d.latest} is out: git pull && ./install.sh`);
+  else if (d.behind && !sourceCurrent) parts.push(controllerOwnsQwen()
+    ? `${d.latest} is out: review upstream before updating Cockpit`
+    : `${d.latest} is out: git pull && ./install.sh`);
   else parts.push('up to date');
   setText('upd', parts.join(' \u00b7 '));
-  const e = $('upd'); if (e) e.classList.toggle('warn', !!d.behind);
+  const e = $('upd'); if (e) e.classList.toggle('warn', !!d.behind && !sourceCurrent);
 }
 
 // ── apply: freshness, banners, isolation ──────────────────────────────────────
-const RENDER = {machine: rMachine, gpu: rGpu, engine_info: rEngineInfo, engine_fast: rEngineFast, decode: rDecode,
+const RENDER = {machine: rMachine, gpu: rGpu, engine_info: rEngineInfo, engine_fast: rEngineFast, decode: rDecode, throughput: rThroughput,
+                image_lab: window.renderImageLab,
                 canary: rCanary, kernel: rKernel, units: rUnits, containers: rContainers, repo: rRepo,
                 lifecycle: rLifecycle, feed: rFeed, reqguard: rGuard, opencode: rOpencode, config: rConfig, job: rJob, agent: rAgent, update: rUpdate};
 document.querySelectorAll('dd, .chip, .num').forEach(e => { if (e.textContent.trim() === '...') e.classList.add('skel'); });
@@ -1355,9 +1389,13 @@ function banners(state, errors){
   // carried this answer since v1.5, behind a button: this says it where the cockpit
   // already says what you did not go looking for.
   const upd = F.update || {};
-  if (upd.behind) add('info', `Version ${upd.latest} is out; this box runs ${upd.installed}.`,
-    // this checkout's own folder, which the cockpit knows: the banner named the default one
-    `Update with: cd ${(F.config || {}).repo_dir || '~/dgx-spark-qwen38'} && git pull && ./install.sh. It keeps your target, context mode, port and cache, and restarts the engine once. The release notes are on GitHub.`);
+  const sourceCurrent = controllerOwnsQwen() && /^\d+\.\d+\.\d+$/.test(F.config?.version || '')
+    && /^v?\d+\.\d+\.\d+$/.test(upd.latest || '')
+    && verCmp(F.config.version, upd.latest.replace(/^v/, '')) >= 0;
+  if (upd.behind && !sourceCurrent) add('info', `Version ${upd.latest} is out; this box runs ${upd.installed}.`,
+    controllerOwnsQwen()
+      ? 'Qwen and ComfyUI are controller-managed here. Review upstream changes, then refresh Cockpit with the Setup tab command; the serving-stack installer manages legacy systemd lanes.'
+      : `Update with: cd ${(F.config || {}).repo_dir || '~/dgx-spark-qwen38'} && git pull && ./install.sh. It keeps your target, context mode, port and cache, and restarts the engine once. The release notes are on GitHub.`);
   if ((upd.stale_code || []).length) add('warn', 'This cockpit is running older code than the files on disk.',
     `${upd.stale_code.join(', ')} changed under it, so its controls and its checks no longer agree. Restart it: sudo systemctl restart qwen38-dashboard.service`);
   const ocf = F.ocfit;
@@ -1468,8 +1506,11 @@ function askAction(name, params, argv, warns){
   const AGENT_EXPLAIN = {stop: 'systemd stops opencode serve: the Agent tab goes dark until the server is started again.',
                          start: 'systemd starts opencode serve on loopback; the Agent tab is back within seconds.',
                          restart: 'systemd restarts opencode serve, which picks up an upgraded binary; the Agent tab reconnects by itself within seconds.'};
+  const managedQwen = name === 'unit' && params.unit === 'qwen38-sglang.service'
+    && F.units?.[params.unit]?.manager === 'spark-model-controller';
   const EXPLAIN = {unit: p => p.unit === AGENT_UNIT ? AGENT_EXPLAIN[p.verb] || ''
                      : p.unit === IMAGE_UNIT ? IMAGE_EXPLAIN[p.verb] || ''
+                     : managedQwen ? 'The model controller owns this Qwen container. Cockpit sends the lifecycle request through its local Unix socket; the ComfyUI worker remains independent.'
                      : p.verb === 'stop' ? 'systemd stops the unit; the container gets SIGTERM and disappears in seconds.' : `systemd starts the unit; the engine loads its weights and is ready in ${readyIn(p.unit)} (watch the boot bar).`,
                    switch: p => (TARGET_NOTE[p.target] ? TARGET_NOTE[p.target] + '\n\n' : '')
                      + (p.target === 'image'
@@ -1483,7 +1524,10 @@ function askAction(name, params, argv, warns){
   $('mtitle').textContent = 'Confirm: ' + (TITLES[name] ? TITLES[name](params) : name);
   $('mwhat').textContent = (EXPLAIN[name] ? EXPLAIN[name](params) : '') + (F.config.dry_run ? '\nDry run: nothing will really be executed.' : '');
   const w = $('mwarn'); w.hidden = !(warns && warns.length); w.textContent = (warns || []).map(x => '⚠ ' + x).join('\n');
-  $('margv').textContent = argv.join(' ');
+  $('margv').textContent = managedQwen
+    ? (params.verb === 'restart' ? 'POST /v1/models/qwen3.8-27b/deactivate\nPOST /v1/models/qwen3.8-27b/activate'
+       : `POST /v1/models/qwen3.8-27b/${params.verb === 'start' ? 'activate' : 'deactivate'}`)
+    : argv.join(' ');
   $('mstatus').textContent = ''; $('mgo').disabled = false;
   $('modal').hidden = false; pending = {name, params};
   setTimeout(() => $('mgo').focus(), 0);

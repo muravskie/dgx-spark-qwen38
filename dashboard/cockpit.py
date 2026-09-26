@@ -17,6 +17,7 @@ import base64
 import hashlib
 import hmac
 import http.server
+import http.client
 import importlib.util
 import json
 import os
@@ -24,6 +25,8 @@ import re
 import secrets
 import shutil
 import signal
+import socket
+import socketserver
 import subprocess
 import threading
 import time
@@ -31,8 +34,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from collections import deque
+from statistics import median
 
 import agent_relay as ar
+import image_lab
 import lifecycle as lc
 import registry as rg
 import recipes as rp
@@ -45,6 +50,11 @@ BIND = os.environ.get("COCKPIT_BIND", "127.0.0.1")
 PORT = int(os.environ.get("COCKPIT_PORT", "30090"))
 ENGINE_BASE = os.environ.get("COCKPIT_ENGINE", "http://127.0.0.1:30000")
 PROXY_BASE = os.environ.get("COCKPIT_PROXY", "http://127.0.0.1:30001")
+MODEL_CONTROLLER_SOCKET = os.environ.get(
+    "COCKPIT_MODEL_CONTROLLER_SOCKET",
+    "/run/spark-model-controller/controller.sock",
+)
+CONTROLLER_27B_MODEL = "qwen3.8-27b"
 # Agent tab: a relay to opencode's web interface, gated by the cockpit session
 # (dashboard/agent_relay.py). Port 0 = no relay, no tab content. The bind is
 # "tailscale" (the tailnet address, resolved when the interface is up) or an address.
@@ -125,7 +135,8 @@ def job_phrase(action: str, params: dict) -> str:
 # now restarts this unit, but a plain `git pull` does not, so the process watches
 # its own sources and says so instead of lying quietly.
 CODE_FILES = ("cockpit.py", "recipes.py", "lifecycle.py", "registry.py",
-              "agent_relay.py", "static/index.html", "static/app.js")
+              "agent_relay.py", "image_lab.py", "static/index.html", "static/app.js",
+              "static/image-lab.js")
 
 
 def code_fingerprint() -> dict:
@@ -239,6 +250,56 @@ def http_json(url: str, timeout: float = 4.0):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key()}"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def http_text(url: str, timeout: float = 4.0) -> str:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key()}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode()
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """Small local client for the model controller's Unix-socket REST API."""
+
+    def __init__(self, socket_path: str, timeout: float = 4.0):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+def controller_request(method: str, path: str, timeout: float = 4.0) -> tuple[int, dict]:
+    connection = UnixHTTPConnection(MODEL_CONTROLLER_SOCKET, timeout)
+    try:
+        connection.request(method, path)
+        response = connection.getresponse()
+        raw = response.read()
+        body = json.loads(raw.decode()) if raw else {}
+        return response.status, body
+    finally:
+        connection.close()
+
+
+def controller_27b() -> dict | None:
+    """Controller observation for the 27B lane, or None when unavailable."""
+    try:
+        # Qwen's configured readiness probe is /health_generate, which takes
+        # about one second by design; a one-second socket timeout races it.
+        status, body = controller_request("GET", "/v1/status", timeout=3.0)
+        if status != 200:
+            return None
+        return next((m for m in body.get("models", [])
+                     if m.get("id") == CONTROLLER_27B_MODEL), None)
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+
+
+def controller_manages_27b() -> bool:
+    model = controller_27b()
+    return bool(model and model.get("ownership") == "managed")
 
 
 # The engine's current routes, and the deprecated ones only on an engine that answers 404 to
@@ -375,6 +436,16 @@ def collect_units():
                   "sub": d.get("SubState", "?"),
                   "enabled": d.get("UnitFileState", "?"),
                   "since": d.get("ExecMainStartTimestamp", "")}
+    managed = controller_27b()
+    if managed and managed.get("ownership") == "managed":
+        running = managed.get("runtime") == "running"
+        out["qwen38-sglang.service"].update(
+            active="active" if running else "inactive",
+            sub="running" if running else "dead",
+            enabled="enabled",
+            since="",
+            manager="spark-model-controller",
+        )
     return {"node_id": "local", "units": out}
 
 
@@ -572,6 +643,8 @@ BOOT_HEAD_READ: dict = {}      # text lanes: the activation whose first minutes 
 POOL_GUARD = os.environ.get("COCKPIT_POOL_GUARD", "1") == "1"
 POOL_GUARD_THRESHOLD = float(os.environ.get("COCKPIT_POOL_GUARD_THRESHOLD", "0.6"))
 LAST_USAGE: dict = {"value": 0.0, "mamba": 0.0, "ts": 0.0}   # pool usage from the engine's own log lines
+THROUGHPUT: dict = {"lane": None, "ts": None, "counters": {},
+                    "recent": deque(maxlen=10)}
 MAMBA_GUARD_THRESHOLD = float(os.environ.get("COCKPIT_MAMBA_GUARD_THRESHOLD", "0.5"))
 IDLE_SINCE: dict = {"ts": None}
 LAST_FLUSH: dict = {"ts": 0.0}
@@ -675,6 +748,59 @@ def collect_decode_telemetry():
     return {"node_id": "local", "lane": active, "decode": last,
             "usage": {"tokens": LAST_USAGE["value"], "mamba": LAST_USAGE["mamba"],
                       "age": round(time.time() - LAST_USAGE["ts"], 1) if LAST_USAGE["ts"] else None}}
+
+
+METRIC_RE = re.compile(r"^sglang:(\w+)\{([^}]*)\}\s+([-+0-9.eE]+)$")
+MODE_RE = re.compile(r'(?:^|,)mode="([^"]+)"')
+
+
+def _metrics_values(raw: str, name: str) -> dict[str, float]:
+    values = {}
+    for line in raw.splitlines():
+        match = METRIC_RE.match(line)
+        if not match or match.group(1) != name:
+            continue
+        try:
+            mode = MODE_RE.search(match.group(2))
+            values[mode.group(1) if mode else "value"] = float(match.group(3))
+        except (AttributeError, ValueError):
+            continue
+    return values
+
+
+@guard
+def collect_throughput():
+    """Read engine rates and derive separate cached/uncached prefill rates."""
+    now = time.time()
+    raw = http_text(ENGINE_BASE + "/metrics", timeout=4)
+    generation = _metrics_values(raw, "gen_throughput").get("value")
+    counters = _metrics_values(raw, "realtime_tokens_total")
+    if not counters:
+        return {"node_id": "local", "error": "engine metrics had no token counters"}
+    previous = THROUGHPUT["counters"]
+    elapsed = now - THROUGHPUT["ts"] if THROUGHPUT["ts"] else None
+    rates = {}
+    if elapsed and elapsed > 0 and THROUGHPUT["lane"] == ENGINE_BASE:
+        for key in ("prefill_compute", "prefill_cache", "decode"):
+            if key in counters and key in previous:
+                delta = counters[key] - previous[key]
+                if delta >= 0:
+                    rates[key] = delta / elapsed
+    THROUGHPUT.update(lane=ENGINE_BASE, ts=now, counters=counters)
+    if generation is not None:
+        rates["generation"] = generation
+    if rates:
+        THROUGHPUT["recent"].append(rates)
+    recent = {}
+    for key in ("prefill_compute", "prefill_cache", "generation"):
+        # Keep idle windows out of the historical performance number. A zero
+        # rate means no work happened, not that the engine worked at zero tok/s.
+        samples = [sample[key] for sample in THROUGHPUT["recent"]
+                   if key in sample and sample[key] > 0]
+        if samples:
+            recent[key] = median(samples)
+    return {"node_id": "local", "current": rates, "recent_median": recent,
+            "sample_count": len(THROUGHPUT["recent"])}
 
 
 @guard
@@ -1202,6 +1328,7 @@ def collect_lifecycle():
     engines = {}
     prev = dict(LIFE.get("states", {}))
     states = {}
+    managed_27b = controller_27b()
     for unit in lc.ENGINE_UNITS + ("qwen38-keepalive.service",):
         raw = run(["systemctl", "show", unit, "-p",
                    "ActiveState,SubState,ActiveEnterTimestampMonotonic,StateChangeTimestampMonotonic,"
@@ -1214,6 +1341,15 @@ def collect_lifecycle():
         is_image = unit == lc.IMAGE_UNIT
         if is_image and not IMAGE_UNIT_PATH.exists():
             continue                    # not installed: no card, no pill, no gate
+        controlled = (unit == "qwen38-sglang.service" and managed_27b
+                      and managed_27b.get("ownership") == "managed")
+        if controlled:
+            active = "active" if managed_27b.get("runtime") == "running" else "inactive"
+            d["SubState"] = "running" if active == "active" else "dead"
+            # The disabled legacy unit's monotonic timestamps describe its old
+            # process, not the controller container. Do not display false uptime.
+            d["ActiveEnterTimestampMonotonic"] = "0"
+            d["StateChangeTimestampMonotonic"] = "0"
         boot = {"stage": None, "fired_up": False, "done": []}
         if is_image:
             st, boot, running = image_engine_state(
@@ -1477,6 +1613,10 @@ def collect_lifecycle():
         r = lc.blocked_reasons(act, {}, states)
         if r:
             blocked[act] = r
+    if managed_27b and managed_27b.get("ownership") == "managed":
+        blocked["switch"] = [
+            "the 27B lane is managed by spark-model-controller; legacy unit-file switching is disabled"
+        ]
     with EVENTS_LOCK:
         ev = list(EVENTS)[-30:]
     # A container serving while its unit is not active: the cockpit's buttons act on the
@@ -1507,11 +1647,19 @@ def collect_jobs():
     return job_snapshot()
 
 
+@guard
+def collect_image_lab():
+    return image_lab.snapshot(
+        controller_request, os.environ.get("COCKPIT_COMFYUI_BASE", "http://127.0.0.1:8188"))
+
+
 TIERS = [
     (1.0, {"machine": collect_machine, "engine_fast": collect_engine_fast, "job": collect_jobs}),
     (2.0, {"lifecycle": collect_lifecycle}),
     (90.0, {"canary": collect_canary}),
-    (3.0, {"gpu": collect_gpu, "decode": collect_decode_telemetry}),
+    (3.0, {"gpu": collect_gpu, "decode": collect_decode_telemetry,
+           "throughput": collect_throughput}),
+    (10.0, {"image_lab": collect_image_lab}),
     (5.0, {"units": collect_units, "containers": collect_containers,
            "feed": collect_feed, "agent": collect_agent}),
     (30.0, {"engine_info": collect_engine_info, "repo": collect_repo, "kernel": collect_kernel,
@@ -1571,7 +1719,7 @@ ACTIONS = {
     "unit": {
         "danger": "medium",
         "params": {"verb": sorted(UNIT_VERBS), "unit": sorted(SERVING_UNITS)},
-        "argv": lambda p: ["sudo", "-n", "/usr/bin/systemctl", p["verb"], p["unit"]],
+        "argv": None,  # job_unit chooses controller API or the legacy exact systemctl argv
         "timeout": 90,
     },
     # model switch (repo script: it never starts, stops or restarts an engine)
@@ -2385,6 +2533,28 @@ def job_abort_all(job: Job):
     return True, ["every in-flight generation aborted (clients see their stream end)"], {"ok": True}
 
 
+def job_unit(job: Job):
+    unit, verb = job.params["unit"], job.params["verb"]
+    if unit == "qwen38-sglang.service" and controller_manages_27b():
+        operations = (["deactivate", "activate"] if verb == "restart"
+                      else ["activate" if verb == "start" else "deactivate"])
+        replies = []
+        for operation in operations:
+            status, body = controller_request(
+                "POST", f"/v1/models/{CONTROLLER_27B_MODEL}/{operation}", timeout=920.0)
+            replies.append(body)
+            if status >= 400:
+                return False, [f"model controller {operation} failed: {body.get('error', body)}"], \
+                    {"ok": False, "controller": True, "responses": replies}
+        return True, [f"model controller {verb}: {CONTROLLER_27B_MODEL}"], \
+            {"ok": True, "controller": True, "responses": replies}
+    argv = ["sudo", "-n", "/usr/bin/systemctl", verb, unit]
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=90)
+    lines = (completed.stdout + completed.stderr).splitlines()
+    return completed.returncode == 0, lines or [f"systemctl {verb}: {unit}"], \
+        {"ok": completed.returncode == 0, "controller": False, "returncode": completed.returncode}
+
+
 def job_smoke(job: Job):
     model = served_model_name()
     job.append(f"canary through the proxy {PROXY_BASE}, model {model}, up to 200 tokens")
@@ -2453,7 +2623,7 @@ def job_diag_bundle(job: Job):
         {"ok": True, "path": str(out), "bytes": size}
 
 
-JOB_FUNCS = {"flush_cache": job_flush_cache, "abort_all": job_abort_all,
+JOB_FUNCS = {"unit": job_unit, "flush_cache": job_flush_cache, "abort_all": job_abort_all,
              "smoke": job_smoke, "diag_bundle": job_diag_bundle}
 
 
@@ -2477,6 +2647,12 @@ def start_action(name: str, params: dict, origin: str = "ui") -> tuple[int, dict
     if name in ("unit", "switch"):
         with LIFE_LOCK:
             states = dict(LIFE.get("states", {}))
+        if name == "switch" and controller_manages_27b():
+            reasons = ["the 27B lane is managed by spark-model-controller; "
+                       "add the target to its registry before switching"]
+            audit({"kind": "action_blocked", "action": name,
+                   "params": clean, "reasons": reasons})
+            return 409, {"error": "blocked", "reasons": reasons}
         reasons = lc.blocked_reasons(name, clean, states)
         if reasons:
             audit({"kind": "action_blocked", "action": name,

@@ -734,7 +734,7 @@
     <button class="nav" data-tab="machine" aria-label="Machine"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg><span class="lab">Machine</span><span class="bdg" id="bdg-machine"></span></button>
     <button class="nav" data-tab="models" aria-label="Models"><svg viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/></svg><span class="lab">Models</span><span class="bdg" id="bdg-models"></span></button>
     <button class="nav" data-tab="systemone" aria-label="System One"><svg viewBox="0 0 24 24"><path d="M4 18V9M9 18V5M14 18v-6M19 18v-9"/><path d="M3 21h18"/></svg><span class="lab">System One</span><span class="bdg" id="bdg-systemone"></span></button>
-    <button class="nav" data-tab="image" aria-label="Image"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M21 16l-5-5-6 6-3-3-4 4"/></svg><span class="lab">Image</span><span class="bdg" id="bdg-image"></span></button>
+    <button class="nav" data-tab="image" aria-label="Image 2.1"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M21 16l-5-5-6 6-3-3-4 4"/></svg><span class="lab">Image 2.1</span><span class="bdg" id="bdg-image"></span></button>
     <button class="nav" data-tab="video" aria-label="Video"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="13" height="14" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg><span class="lab">Video</span><span class="bdg" id="bdg-video"></span></button>
     <button class="nav" data-tab="logs" aria-label="Logs"><svg viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h9"/></svg><span class="lab">Logs</span><span class="bdg" id="bdg-logs"></span></button>
     <button class="nav" data-tab="setup" aria-label="Setup"><svg viewBox="0 0 24 24"><path d="M4 8h10M18 8h2M4 16h4M12 16h8"/><circle cx="15" cy="8" r="2"/><circle cx="9" cy="16" r="2"/></svg><span class="lab">Setup</span><span class="bdg" id="bdg-setup"></span></button>
@@ -779,17 +779,47 @@
           </div>
         </section>
 
+        <section class="panel wide" data-src="image_lab">
+          <h3>ComfyUI serving lane <span class="chip" id="image-lane-chip">...</span><span class="right"><span class="age"></span></span></h3>
+          <div class="row" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap"><span class="name" id="image-version">...</span><a class="btn mini ghost" id="image-open" target="_blank" rel="noopener noreferrer">Open ComfyUI</a></div>
+          <div class="facts">
+            <div><span>Managed by</span><b id="image-owner">...</b></div>
+            <div><span>Runtime</span><b id="image-runtime">...</b></div>
+            <div><span>Roles</span><b id="image-roles">...</b></div>
+            <div><span>API health</span><b id="image-api">...</b></div>
+          </div>
+        </section>
+
+        <div class="grid two wide">
         <section class="panel" data-src="engine_fast,decode,canary">
           <h3>Right now <span class="chip" id="loadchip">...</span><span class="right"><span class="age"></span></span></h3>
           <dl class="kv">
             <dt>Running</dt><dd class="num" id="reqrun">...</dd>
             <dt>Waiting</dt><dd class="num" id="reqwait">...</dd>
             <dt>Tokens in KV</dt><dd class="num" id="reqtok">...</dd>
+            <dt>Prefill (uncached)</dt><dd class="num" id="prefillrate">...</dd>
+            <dt>Prefill (cached)</dt><dd class="num" id="cacherate">...</dd>
+            <dt>Generation</dt><dd class="num" id="genrate">...</dd>
+            <dt>Median</dt><dd class="num" id="throughputmedian">...</dd>
             <dt>Accept length</dt><dd class="num" id="acclen">...</dd>
             <dt>Generation probe</dt><dd id="canary">...</dd>
           </dl>
           <canvas class="spark" id="reqspark" width="600" height="92"></canvas>
         </section>
+
+        <section class="panel" data-src="image_lab">
+          <h3>ComfyUI right now <span class="right"><span class="age"></span></span></h3>
+          <dl class="kv">
+            <dt>Running workflows</dt><dd class="num" id="image-running">...</dd>
+            <dt>Waiting workflows</dt><dd class="num" id="image-pending">...</dd>
+            <dt id="image-model-label">Workflow model</dt><dd class="num" id="image-model">...</dd>
+            <dt>Last result</dt><dd id="image-last-result">...</dd>
+            <dt>Last duration</dt><dd class="num" id="image-last-duration">...</dd>
+            <dt>Recent workflows</dt><dd id="image-recent">...</dd>
+          </dl>
+          <p class="note" id="image-queue-note"></p>
+        </section>
+        </div>
 
         <section class="panel" data-src="machine,kernel">
           <h3>Unified memory <span class="chip" id="memchip">...</span><span class="right"><span class="age"></span></span></h3>
@@ -1293,8 +1323,8 @@
           <p class="note" id="ocnote">...</p>
         </section>
         <section class="panel">
-          <h3>Update the serving stack</h3>
-          <p class="note" style="margin:0 0 8px">The installer needs an interactive sudo, so it is not a button (a half-applied install is the one thing this cockpit must never cause). Run it in a terminal on the box; your choices (model, context mode, port, opencode on or off) are remembered.</p>
+          <h3 id="update-head">Update the serving stack</h3>
+          <p class="note" id="update-note" style="margin:0 0 8px">The installer needs an interactive sudo, so it is not a button (a half-applied install is the one thing this cockpit must never cause). Run it in a terminal on the box; your choices (model, context mode, port, opencode on or off) are remembered.</p>
           <pre class="cmd" id="updatecmd">...</pre>
         </section>
         <section class="panel">
@@ -1327,6 +1357,7 @@
 </div>
 <div class="toast" id="toast" hidden role="status"></div>
 
+<script src="/static/image-lab.js" defer></script>
 <script src="/static/app.js" defer></script>
 </body>
 </html>
