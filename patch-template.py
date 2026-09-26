@@ -35,7 +35,6 @@ EFFORT_PATCHED = (
     "    {%- endif %}\n"
     "    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low', 'lean') %}"
 )
-
 # -- Patch 3: the "lean" effort level, and it becomes the default -------------
 # Qwen ships three levels and defaults to the most expensive one. Measured on
 # this box (Qwen3.8-27B NVFP4 on SGLang, 7,008 runs; method and tables in
@@ -152,7 +151,7 @@ def main() -> None:
         if anchor in tpl:
             tpl = tpl.replace(anchor, patched, 1)
             print(f"patch '{name}': applied")
-        elif marker in tpl:
+        elif patched in tpl or marker in tpl:
             print(f"patch '{name}': already present upstream, nothing to do")
         else:
             sys.exit(
