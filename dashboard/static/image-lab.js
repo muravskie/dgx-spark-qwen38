@@ -2,6 +2,10 @@
 /* Overview-only renderer. Server telemetry contains names and counts, not prompts. */
 window.renderImageLab = function renderImageLab(data){
   const put = (id, value) => { const node = document.getElementById(id); if (node) node.textContent = value; };
+  const timeOf = ms => {
+    if (typeof ms !== 'number' || !Number.isFinite(ms)) return null;
+    return new Date(ms).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: false});
+  };
   const controller = data.controller;
   const queue = data.queue;
   const history = data.history;
@@ -27,9 +31,11 @@ window.renderImageLab = function renderImageLab(data){
   const model = queue && queue.running_model ? queue.running_model : last && last.model;
   put('image-model-label', queue && queue.running_model ? 'Running workflow model' : 'Last workflow model');
   put('image-model', model || (queue && queue.running ? 'model not reported' : 'none observed'));
-  put('image-last-result', last ? (last.status || 'unknown') : 'none observed');
+  const lastTime = last && timeOf(last.finished_ms);
+  put('image-last-result', last ? `${last.status || 'unknown'}${lastTime ? ` · ${lastTime}` : ''}` : 'none observed');
   put('image-last-duration', last && last.duration_seconds != null ? `${last.duration_seconds.toFixed(1)} s` : 'unknown');
-  put('image-recent', history ? `${history.successful} succeeded · ${history.failed} failed (${history.sample_size} recent)` : 'unknown');
+  const windowStart = history && timeOf(history.window_started_ms);
+  put('image-recent', history ? `${history.successful} succeeded · ${history.failed} failed (${history.sample_size} recent${windowStart ? ` · since ${windowStart}` : ''})` : 'unknown');
   put('image-queue-note', data.queue_error ? 'ComfyUI queue unavailable' : data.history_error ? 'Recent history unavailable' :
     'API readiness does not verify that a workflow can load weights and finish.');
 };

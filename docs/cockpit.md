@@ -314,4 +314,141 @@ sudo rm -f /etc/systemd/system/opencode-web.service
 DASH_AGENT_PORT=0 dashboard/install-dashboard.sh       # the cockpit without the relay
 ```
 
+### OpenCode on Uba, connected over the LAN
+
+The Agent panel can proxy OpenCode on Uba without exposing OpenCode to the LAN
+or tailnet. OpenCode stays bound to Uba's loopback. A dedicated SSH key opens
+one reverse tunnel over the LAN to Spark's `127.0.0.1:14096`; Spark's
+`cockpit-agent` account accepts only that tunnel, only from Uba's actual LAN
+source address. The browser reaches the Cockpit and its session-gated relay on
+Spark's tailnet address.
+
+#### 1. Find Uba's LAN source address and OpenCode port
+
+Run on Uba, using Spark's LAN IP (not its tailnet IP):
+
+```bash
+ip route get 192.168.1.64
+opencode service status
+```
+
+Use the `src` address from the route output for `UBA_LAN_IP`. This matters when
+Uba has multiple LAN addresses: the address that `uba.local` resolves to may
+not be the source address SSH uses. In this setup the route used
+`src 192.168.1.69`, even though `uba.local` resolved to `192.168.1.94`.
+
+For OpenCode's shared background service, use the port printed by
+`opencode service status`; do not assume port 4096. Its port can change after a
+service restart. For a standalone `opencode serve --port ...`, use that
+explicit port instead. The tunnel installer refuses a listener bound beyond
+Uba loopback.
+
+#### 2. Prepare and install the restricted SSH key
+
+The scripts live in Spark's checkout. From Uba, prepare a dedicated key and
+pin Spark's SSH host key by streaming the Uba helper over the existing
+Uba-to-Spark LAN SSH connection:
+
+```bash
+OPENCODE_PORT=49374 # use the port reported by `opencode service status`
+ssh fedor@192.168.1.64 \
+  'cat /home/fedor/code/dgx-spark-qwen38/dashboard/install-agent-tunnel-uba.sh' \
+  | OPENCODE_PORT="$OPENCODE_PORT" bash -s -- --prepare
+```
+
+Copy the printed public key to Spark over the LAN:
+
+```bash
+scp ~/.ssh/cockpit-agent-tunnel.pub fedor@192.168.1.64:/tmp/uba-agent.pub
+```
+
+On Spark, run the Spark helper as your normal user. Set `UBA_LAN_IP` to the
+`src` address found in step 1; the helper uses sudo to create the restricted
+account and reload sshd:
+
+```bash
+UBA_LAN_IP=192.168.1.69 \
+UBA_TUNNEL_PUBKEY_FILE=/tmp/uba-agent.pub \
+dashboard/install-agent-tunnel-spark.sh
+```
+
+The account has no login shell, password, TTY, agent forwarding, or X11
+forwarding. Its key is limited to remote forwarding on
+`127.0.0.1:14096`, and sshd accepts it only from Uba's LAN source IP. The key
+file stays root-owned; `.ssh` is mode `0755` and `authorized_keys` is mode
+`0644` so sshd can read the public key while the account cannot change it.
+
+If SSH reports `Permission denied (publickey)`, compare Uba's current `src`
+address from `ip route get 192.168.1.64` with the Spark helper's `UBA_LAN_IP`.
+If Spark's sshd log says it cannot open `authorized_keys`, rerun the current
+Spark helper to restore its readable, root-owned permissions.
+
+#### 3. Install the Uba reverse tunnel
+
+On Uba, get the shared-service port and stream the helper from Spark. For this
+setup, `opencode service status` reported `127.0.0.1:49374`; substitute the
+current port if it has changed:
+
+```bash
+OPENCODE_PORT=49374
+ssh fedor@192.168.1.64 \
+  'cat /home/fedor/code/dgx-spark-qwen38/dashboard/install-agent-tunnel-uba.sh' \
+  | OPENCODE_PORT="$OPENCODE_PORT" bash -s -- --install
+```
+
+The helper pins Spark's SSH host key, verifies that the OpenCode listener is
+loopback-only, and enables a user systemd service. Re-running `--install`
+restarts the tunnel so a changed OpenCode port takes effect. Enable lingering
+once on Uba so it survives logout and reboot:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Check the service with `systemctl --user status qwen38-agent-tunnel.service`.
+On Spark, `ss -ltn 'sport = :14096'` should show only
+`127.0.0.1:14096`. The OpenCode service itself remains bound to Uba loopback.
+
+#### 4. Copy OpenCode's Basic-auth secret to Spark
+
+OpenCode v2 stores its shared-service password in
+`~/.config/opencode/service.json`. Copy that file over the LAN SSH connection;
+do not paste the password into chat or a command line:
+
+```bash
+scp /home/fedor/.config/opencode/service.json \
+  fedor@192.168.1.64:/home/fedor/.config/qwen38/opencode-uba-service.json &&
+ssh fedor@192.168.1.64 \
+  'chmod 600 /home/fedor/.config/qwen38/opencode-uba-service.json'
+```
+
+The relay reads the password (and optional username) from this protected copy
+and sends HTTP Basic auth only inside the SSH tunnel. The password grants full
+OpenCode API access; rotate it if it is exposed, then recopy the file.
+
+#### 5. Install the remote relay on Spark
+
+Run on Spark. The installer uses sudo to update the dashboard unit and restarts
+Cockpit with the remote Agent settings:
+
+```bash
+DASH_AGENT_PORT=30091 \
+DASH_AGENT_BIND=tailscale \
+DASH_AGENT_UPSTREAM=http://127.0.0.1:14096 \
+DASH_AGENT_REMOTE=1 \
+dashboard/install-dashboard.sh
+```
+
+The relay listens only on Spark's tailnet address and requires a Cockpit
+session. It proxies Uba's OpenCode web app through the LAN SSH tunnel. Remote
+mode reads Uba's health/version through OpenCode v2's authenticated `/api/info`
+endpoint; local restart, logs, and limit-fitting controls are disabled. Open
+`http://<Spark-tailnet-IP>:30090/#agent` and sign in with the Cockpit API key.
+
+If the relay says Uba is unreachable after OpenCode restarts, check
+`opencode service status` on Uba and rerun the tunnel install with its current
+port. If health reports rejected credentials, verify that the copied
+`service.json` came from the same Uba account/service and recopy it with mode
+`0600`.
+
 [Back to the README](../README.md)

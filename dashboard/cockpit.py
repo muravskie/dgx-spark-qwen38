@@ -61,6 +61,9 @@ CONTROLLER_27B_MODEL = "qwen3.8-27b"
 AGENT_PORT = int(os.environ.get("COCKPIT_AGENT_PORT", "0") or 0)
 AGENT_BIND = os.environ.get("COCKPIT_AGENT_BIND", "tailscale")
 AGENT_UPSTREAM = os.environ.get("COCKPIT_AGENT_UPSTREAM", "http://127.0.0.1:4096")
+# A remote Agent server can be reached through a loopback-only reverse SSH tunnel.
+# Its lifecycle is owned by the remote box, so never inspect or control a local unit.
+AGENT_REMOTE = os.environ.get("COCKPIT_AGENT_REMOTE", "0") == "1"
 AGENT_UNIT = "opencode-web.service"
 STATIC_DIR = HERE / "static"
 
@@ -893,7 +896,7 @@ def fit_verdict(ctx: int, outp: int, usable: int, prompt_cap: int, window: int =
 
 # Fit opencode's limits once the serving engine has booted, when the ones declared do not
 # fit its pool (maybe_autofit). COCKPIT_AUTOFIT=0 leaves it to the Setup tab's button.
-AUTOFIT = os.environ.get("COCKPIT_AUTOFIT", "1") == "1"
+AUTOFIT = not AGENT_REMOTE and os.environ.get("COCKPIT_AUTOFIT", "1") == "1"
 AUTOFIT_DONE: dict = {}          # text unit -> the activation its limits were fitted in
 _OC_FIT: dict = {}               # oc-fit-limits.py, loaded once for its fit() formula
 
@@ -1046,6 +1049,7 @@ def collect_opencode():
 
 # ── Agent tab: opencode web behind the cockpit session ───────────────────────
 AGENT_ENV_FILE = CONFIG_DIR / "opencode-web.env"
+AGENT_REMOTE_CREDENTIALS_FILE = CONFIG_DIR / "opencode-uba-service.json"
 AGENT_UNIT_PATH = Path("/etc/systemd/system") / AGENT_UNIT
 AGENT = {"bind": None, "port": AGENT_PORT, "listening": False, "error": None, "since": None}
 AGENT_BINARY: dict = {"key": None, "version": None}
@@ -1058,8 +1062,11 @@ def cookie_authed(cookie_header: str | None) -> bool:
 
 def agent_config() -> "ar.RelayConfig":
     return ar.RelayConfig(upstream=ar.split_upstream(AGENT_UPSTREAM),
-                          credentials=lambda: ar.read_credentials(AGENT_ENV_FILE),
-                          is_authed=cookie_authed, cockpit_port=PORT)
+                          credentials=lambda: ar.read_credentials(
+                              AGENT_REMOTE_CREDENTIALS_FILE if AGENT_REMOTE else AGENT_ENV_FILE),
+                          is_authed=cookie_authed, cockpit_port=PORT,
+                          allow_no_upstream_auth=AGENT_REMOTE,
+                          health_path="/api/info" if AGENT_REMOTE else "/global/health")
 
 
 def agent_binary_version() -> str | None:
@@ -1098,9 +1105,11 @@ def opencode_pinned() -> str | None:
 
 @guard
 def collect_agent():
-    out = {"node_id": "local", "enabled": AGENT_PORT > 0, "relay": dict(AGENT),
+    out = {"node_id": "uba" if AGENT_REMOTE else "local", "remote": AGENT_REMOTE,
+           "enabled": AGENT_PORT > 0, "relay": dict(AGENT),
            "upstream": AGENT_UPSTREAM, "unit": None, "server": None, "binary": None,
-           "credentials": AGENT_ENV_FILE.is_file(), "unit_installed": AGENT_UNIT_PATH.is_file(),
+           "credentials": (AGENT_REMOTE_CREDENTIALS_FILE if AGENT_REMOTE else AGENT_ENV_FILE).is_file(),
+           "unit_installed": AGENT_UNIT_PATH.is_file(),
            "pinned": opencode_pinned()}
     if AGENT_PORT <= 0:
         # Not installed: is it because this box has no opencode at all? That changes what
@@ -1109,22 +1118,31 @@ def collect_agent():
         home_bin = Path.home() / ".opencode" / "bin" / "opencode"
         out["opencode_found"] = shutil.which("opencode") or (str(home_bin) if home_bin.is_file() else None)
         return out
-    raw = run(["systemctl", "show", AGENT_UNIT, "-p", "ActiveState,SubState,UnitFileState,ExecMainStartTimestamp"])
-    d = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
-    out["unit"] = {"active": d.get("ActiveState", "?"), "sub": d.get("SubState", "?"),
-                   "enabled": d.get("UnitFileState", "?"), "since": d.get("ExecMainStartTimestamp", "")}
     cfg = agent_config()
     out["server"] = ar.health(cfg)
-    out["binary"] = agent_binary_version()
     out["pinned"] = opencode_pinned()
+    if AGENT_REMOTE:
+        # The SSH tunnel is deliberately loopback-only on both ends. Backend health
+        # is the reliable remote status; local systemd says nothing about Uba.
+        out["unit"] = {"active": "active" if out["server"].get("healthy") else "unreachable",
+                       "enabled": "remote"}
+        out["unit_installed"] = False
+    else:
+        raw = run(["systemctl", "show", AGENT_UNIT, "-p", "ActiveState,SubState,UnitFileState,ExecMainStartTimestamp"])
+        d = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+        out["unit"] = {"active": d.get("ActiveState", "?"), "sub": d.get("SubState", "?"),
+                       "enabled": d.get("UnitFileState", "?"), "since": d.get("ExecMainStartTimestamp", "")}
+        out["binary"] = agent_binary_version()
     # permission mode: what the unit file says (applies at the next start) and what
     # the running server actually serves; they differ until a restart
-    try:
-        out["auto"] = any(ln.startswith("Environment=") and "OPENCODE_PERMISSION=" in ln
-                          for ln in AGENT_UNIT_PATH.read_text().splitlines())
-    except OSError:
-        out["auto"] = None
-    served = ar.upstream_json(cfg, "/config") if out["server"].get("healthy") else None
+    if not AGENT_REMOTE:
+        try:
+            out["auto"] = any(ln.startswith("Environment=") and "OPENCODE_PERMISSION=" in ln
+                              for ln in AGENT_UNIT_PATH.read_text().splitlines())
+        except OSError:
+            out["auto"] = None
+    served = (ar.upstream_json(cfg, "/config")
+              if out["server"].get("healthy") and not AGENT_REMOTE else None)
     out["auto_live"] = ar.permission_is_auto(served.get("permission")) if isinstance(served, dict) else None
     return out
 
@@ -1183,8 +1201,10 @@ def _semver(tag):
 def collect_update():
     """{installed, latest, behind, stale_code}. Every field is optional: a box with no
     network, or one that opted out, reports what it knows and claims nothing else."""
-    out = {"installed": run(["git", "-C", str(REPO_DIR), "describe", "--tags",
-                             "--abbrev=0"]).strip() or None}
+    # CHANGELOG.md is the installed checkout's release marker (also used for VERSION
+    # above). `git describe` can report an old release when a clone has the current
+    # release commit but has not fetched its tag, making the cockpit claim it is behind.
+    out = {"installed": "v" + VERSION if _semver(VERSION) else None}
     stale = code_is_stale()
     if stale:
         out["stale_code"] = stale
@@ -1710,7 +1730,9 @@ AUDIT_LOG = CONFIG_DIR / "cockpit-audit.log"
 # is not a cockpit. Starting it stops the text lane (the unit's own Conflicts=), which is
 # why the modal says so before it runs.
 SERVING_UNITS = {"qwen38-sglang.service", "qwen38-flash.service",
-                 "qwen38-keepalive.service", "qwen38-image.service", AGENT_UNIT}
+                 "qwen38-keepalive.service", "qwen38-image.service"}
+if not AGENT_REMOTE:
+    SERVING_UNITS.add(AGENT_UNIT)
 UNIT_VERBS = {"start", "stop", "restart"}
 
 ACTIONS = {
@@ -2631,6 +2653,8 @@ def start_action(name: str, params: dict, origin: str = "ui") -> tuple[int, dict
     spec = ACTIONS.get(name)
     if not spec:
         return 404, {"error": "unknown action"}
+    if AGENT_REMOTE and name == "fit_opencode":
+        return 409, {"error": "the remote OpenCode limits are managed on Uba"}
     # The caller is the HTTP layer or the autoheal, so the shape is checked here
     # too: a JSON list or scalar in "params" reached .get() and raised.
     if not isinstance(params, dict):
@@ -2710,6 +2734,7 @@ def _session_secret() -> bytes:
 
 
 SESSION_SECRET = _session_secret()
+SESSION_MAX_AGE = 30 * 24 * 60 * 60
 
 UPSTREAM_CACHE: dict = {"ts": 0.0, "data": None}
 UPSTREAM_LOCK = threading.Lock()
@@ -2876,7 +2901,7 @@ def make_token(kind: str) -> str:
     return f"{raw}:{sig}"
 
 
-def check_token(tok: str, kind: str, max_age: int = 12 * 3600) -> bool:
+def check_token(tok: str, kind: str, max_age: int = SESSION_MAX_AGE) -> bool:
     try:
         k, ts, sig = tok.split(":")
         good = hmac.new(SESSION_SECRET, f"{k}:{ts}".encode(),
@@ -3097,7 +3122,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Set-Cookie",
-                             f"cockpit={tok}; HttpOnly; SameSite=Strict; Path=/")
+                             f"cockpit={tok}; Max-Age={SESSION_MAX_AGE}; HttpOnly; SameSite=Strict; Path=/")
             self.end_headers()
             self.wfile.write(body)
             return

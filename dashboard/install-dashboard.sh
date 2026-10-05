@@ -38,9 +38,15 @@ BIND="${DASH_BIND:-$(installed COCKPIT_BIND)}"; BIND="${BIND:-127.0.0.1}"
 AGENT_PORT="${DASH_AGENT_PORT:-$(installed COCKPIT_AGENT_PORT)}"; AGENT_PORT="${AGENT_PORT:-0}"
 AGENT_BIND="${DASH_AGENT_BIND:-$(installed COCKPIT_AGENT_BIND)}"; AGENT_BIND="${AGENT_BIND:-tailscale}"
 AGENT_UPSTREAM="${DASH_AGENT_UPSTREAM:-$(installed COCKPIT_AGENT_UPSTREAM)}"; AGENT_UPSTREAM="${AGENT_UPSTREAM:-http://127.0.0.1:4096}"
+AGENT_REMOTE="${DASH_AGENT_REMOTE:-$(installed COCKPIT_AGENT_REMOTE)}"; AGENT_REMOTE="${AGENT_REMOTE:-0}"
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "DASH_PORT must be a number (got '$PORT')"
 [[ "$AGENT_PORT" =~ ^[0-9]+$ ]] || die "DASH_AGENT_PORT must be a number (got '$AGENT_PORT')"
 [ "$AGENT_PORT" != "$PORT" ] || die "the agent relay cannot share the cockpit port $PORT"
+[[ "$AGENT_REMOTE" = 0 || "$AGENT_REMOTE" = 1 ]] || die "DASH_AGENT_REMOTE must be 0 or 1"
+if [ "$AGENT_REMOTE" = 1 ]; then
+  [[ "$AGENT_UPSTREAM" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
+    || die "remote Agent upstream must be a loopback URL (the Uba SSH tunnel), e.g. http://127.0.0.1:14096"
+fi
 case "$BIND$AGENT_BIND$AGENT_UPSTREAM" in *'|'*|*' '*) die "bind and upstream values must not contain spaces or |" ;; esac
 # The cockpit's two servers speak IPv4: DASH_BIND=:: made the unit fail at every start and
 # systemd restart it forever (found in review, 2026-09-24). 0.0.0.0 is every interface.
@@ -82,7 +88,7 @@ sed -e "s|__PORT__|$PORT|g" -e "s|__BIND__|$BIND|g" -e "s|__USER__|$(id -un)|g" 
     -e "s|__GROUP__|$(id -gn)|g" -e "s|__REPO_DIR__|$REPO_DIR|g" \
     -e "s|__HOME__|$HOME|g" \
     -e "s|__AGENT_PORT__|$AGENT_PORT|g" -e "s|__AGENT_BIND__|$AGENT_BIND|g" \
-    -e "s|__AGENT_UPSTREAM__|$AGENT_UPSTREAM|g" \
+    -e "s|__AGENT_UPSTREAM__|$AGENT_UPSTREAM|g" -e "s|__AGENT_REMOTE__|$AGENT_REMOTE|g" \
     "$HERE/qwen38-dashboard.service.template" > "$TMP_UNIT"
 grep -q '__[A-Z][A-Z0-9_]*__' "$TMP_UNIT" && die "unsubstituted placeholder in unit"
 DASH_CHANGED=0
@@ -124,7 +130,11 @@ if [ "$BIND" != "127.0.0.1" ] && [ "$BIND" != "localhost" ] && [ "$BIND" != "::1
     || echo "WARNING: $HOME/.config/qwen38/api-key is missing or empty, so nobody can log in."
 fi
 if [ "$AGENT_PORT" != "0" ]; then
-  echo "Agent relay: $AGENT_BIND:$AGENT_PORT -> $AGENT_UPSTREAM (Agent tab; a cockpit session is required)"
+  if [ "$AGENT_REMOTE" = 1 ]; then
+    echo "Agent relay: $AGENT_BIND:$AGENT_PORT -> $AGENT_UPSTREAM (remote OpenCode via loopback SSH tunnel; a cockpit session is required)"
+  else
+    echo "Agent relay: $AGENT_BIND:$AGENT_PORT -> $AGENT_UPSTREAM (Agent tab; a cockpit session is required)"
+  fi
 fi
 REMOVE="sudo systemctl disable --now $UNIT; sudo rm -f $INSTALLED /etc/sudoers.d/qwen38-cockpit /usr/local/bin/qwen38-pyspy-scheduler"
 [ -f /etc/systemd/system/opencode-web.service ] && REMOVE="$REMOVE; sudo systemctl disable --now opencode-web.service; sudo rm -f /etc/systemd/system/opencode-web.service"

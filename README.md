@@ -18,6 +18,48 @@ The flash path serves a model that does not otherwise fit: the 176B checkpoint's
 
 Whatever the target, you get the same surface: an **OpenAI-compatible API** on port 30000 (both lanes also speak the Anthropic protocol), a keepalive proxy for agent CLIs on 30001, and **[opencode](https://opencode.ai) works out of the box** (the installer writes a ready-to-use provider config; the chat template ships pre-patched for agentic clients). The stack is built to grow: more targets, engines and drafters will slot into the same switch surface.
 
+## Lifecycle ownership and the Spark Model Controller
+
+This repository is a complete standalone Qwen serving distribution. In that
+mode, its installer, `qwen38-sglang.service`, and `switch-model.sh` own the
+Qwen host-service lifecycle. The separate `spark-model-controller` project is
+a generic lifecycle controller for GPU containers, including both Qwen and
+the image worker; it is not another name for this Qwen distribution.
+
+On a host **before** an explicit handoff, this repository's service remains the
+Qwen owner. On a host **after** the controller's Qwen migration succeeds,
+`spark-model-controller` must be the sole lifecycle owner for the adopted Qwen
+container. This repository remains useful for Qwen runtime configuration,
+model artifacts, and serving improvements, but its host-service installer or
+switcher must not silently recreate or re-enable a competing Qwen service on
+that host.
+
+This is a real merge risk: importing changes from this repository's GitHub
+upstream can bring back service installation or switching behavior even when
+the incoming change is primarily about model/runtime support. For
+controller-managed hosts, review upstream changes to `install.sh`,
+`switch-model.sh`, systemd templates, service start/stop/restart commands, and
+Cockpit actions as lifecycle changes. Keep runtime/model improvements while
+preserving the controller's ownership boundary; do not treat an upstream merge
+as safe just because it passes this repository's standalone workflow. Cockpit
+already detects controller-owned Qwen and blocks its legacy lane-switch
+action, but that guard does not cover the standalone stack installer or every
+service-management path. This README is a warning, not a merge guard; review
+upstream lifecycle changes before applying them to a controller-managed host.
+
+The intended division is:
+
+- **Qwen serving distribution:** Qwen-specific model/runtime definitions and
+  standalone deployment knowledge.
+- **Spark Model Controller:** authoritative lifecycle and conflict handling
+  for adopted GPU containers, including Qwen and image workloads.
+- **Cockpit:** operator interface; its Qwen controls must not become a second
+  lifecycle writer after handoff.
+
+The preview-first handoff procedure is documented in the
+`spark-model-controller` project's README under **Installation and handoff**.
+The remote Agent-panel setup is in [`docs/cockpit.md`](docs/cockpit.md).
+
 ## Where everything is
 
 The README is the entry point. Everything longer lives next to it, one subject per file.

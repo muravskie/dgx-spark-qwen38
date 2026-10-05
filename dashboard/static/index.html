@@ -170,6 +170,8 @@
   .grid .wide{grid-column:1 / -1}
   /* Two panels that belong together fill the row instead of leaving a third of it empty. */
   .grid.two{grid-template-columns:repeat(auto-fit, minmax(min(430px, 100%), 1fr))}
+  /* The four overview gauges are equally sized in one glance row on desktop. */
+  @media (min-width:1200px){ .grid.glance{grid-template-columns:repeat(4, minmax(0, 1fr))} }
   /* A main surface and its sidecar: the request feed and its pool, the events and the jobs. */
   @media (min-width:1080px){ .grid.split{grid-template-columns:minmax(0,2fr) minmax(0,1fr)} }
   .tabhead{display:flex; align-items:baseline; gap:12px; margin:0 0 var(--s5); flex-wrap:wrap}
@@ -790,7 +792,7 @@
           </div>
         </section>
 
-        <div class="grid two wide">
+        <div class="grid glance wide">
         <section class="panel" data-src="engine_fast,decode,canary">
           <h3>Right now <span class="chip" id="loadchip">...</span><span class="right"><span class="age"></span></span></h3>
           <dl class="kv">
@@ -819,7 +821,6 @@
           </dl>
           <p class="note" id="image-queue-note"></p>
         </section>
-        </div>
 
         <section class="panel" data-src="machine,kernel">
           <h3>Unified memory <span class="chip" id="memchip">...</span><span class="right"><span class="age"></span></span></h3>
@@ -838,6 +839,7 @@
           <h3>Events <span class="right"><span class="age"></span></span></h3>
           <div id="evtlist" role="log" aria-live="polite" aria-relevant="additions"><p class="empty">no events yet in this cockpit session</p></div>
         </section>
+        </div>
       </div>
     </div>
 
@@ -1318,7 +1320,7 @@
             <dt>Launcher</dt><dd id="oclauncher">...</dd>
             <dt>Limits vs this lane</dt><dd id="ocfit">...</dd>
           </dl>
-          <div style="margin-top:10px"><button class="btn mini" data-act="fit_opencode">Fit the limits to this engine</button></div>
+          <div style="margin-top:10px"><button class="btn mini" id="fitoc" data-act="fit_opencode">Fit the limits to this engine</button></div>
           <pre id="occmd" class="cmd" style="margin-top:10px">oc</pre>
           <p class="note" id="ocnote">...</p>
         </section>

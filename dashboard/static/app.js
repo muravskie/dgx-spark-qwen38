@@ -1152,10 +1152,12 @@ function mountAgent(){
 function reloadAgent(){ const f = $('agiframe'); if (f) f.src = agentUrl(); else mountAgent(); }
 function rAgent(d){
   F.agent = d;
-  const opt = $('logopt-agent'); if (opt) opt.hidden = !d.enabled;
+  const fitButton = $('fitoc'); if (fitButton) fitButton.hidden = !!d.remote;
+  const opt = $('logopt-agent'); if (opt) opt.hidden = !d.enabled || !!d.remote;
   if (!d.enabled){
-    setChip('agchip', 'not installed', '');
-    setText('agline', 'one install on the box adds opencode here, behind this login');
+    setChip('agchip', d.remote ? 'relay disabled' : 'not installed', '');
+    setText('agline', d.remote ? 'remote OpenCode is selected, but its cockpit relay is disabled'
+                               : 'one install on the box adds opencode here, behind this login');
     ['agopen', 'agreload', 'agrestart'].forEach(id => { $(id).hidden = true; });
     $('agnote').hidden = true;
     // No opencode at all is the first-time case: install.sh installs the pinned one and
@@ -1172,20 +1174,23 @@ function rAgent(d){
   const r = d.relay || {}, sv = d.server || {}, u = d.unit || {};
   const ready = agentReady(), unitOn = u.active === 'active';
   const [chip, cls] = ready ? ['ready', 'ok'] : !r.listening ? ['relay waiting', 'warn']
+                    : d.remote ? ['Uba unreachable', 'err']
                     : !unitOn ? [u.active === 'failed' ? 'server failed' : 'server stopped', 'err'] : ['server starting', 'warn live'];
   setChip('agchip', chip, cls);
   const parts = [];
+  if (d.remote) parts.push('Uba via LAN SSH tunnel');
   if (sv.version) parts.push('opencode ' + sv.version);
   if (r.listening) parts.push(`relay ${r.bind}:${r.port}`); else if (r.error) parts.push(r.error);
   if (d.binary && sv.version && d.binary !== sv.version) parts.push(`binary ${d.binary} installed, restart to serve it`);
   // install.sh pins the version the repo's opencode tuning was measured on; say when this one is another
   if (d.pinned && sv.version && sv.version !== d.pinned)
-    parts.push(verCmp(sv.version, d.pinned) < 0 ? `this repo tests ${d.pinned}: ./install.sh brings it in line`
-                                                : `newer than the ${d.pinned} this repo tests`);
-  else if (unitOn && u.enabled) parts.push(u.enabled === 'enabled' ? 'starts at boot' : u.enabled);
+    parts.push(d.remote ? `Uba runs ${sv.version}; this repo tunes against ${d.pinned}`
+      : verCmp(sv.version, d.pinned) < 0 ? `this repo tests ${d.pinned}: ./install.sh brings it in line`
+                                         : `newer than the ${d.pinned} this repo tests`);
+  else if (!d.remote && unitOn && u.enabled) parts.push(u.enabled === 'enabled' ? 'starts at boot' : u.enabled);
   if (d.auto_live != null) parts.push(d.auto_live ? 'auto-approve: every tool call runs' : 'asks before risky tool calls');
   if (d.auto != null && d.auto_live != null && d.auto !== d.auto_live) parts.push('permission mode changed in the unit, restart to apply');
-  if (!ready && unitOn && sv.error) parts.push(sv.error);
+  if (!ready && sv.error) parts.push(sv.error);
   setText('agline', parts.join(' · '));
   $('agopen').hidden = !ready; $('agreload').hidden = !ready; $('agmax').hidden = !ready; $('agrestart').hidden = !d.unit_installed;
   if (agentUrl()) $('agopen').href = agentUrl();
@@ -1202,6 +1207,7 @@ function rAgent(d){
     if (activeTab === 'agent') applyAgentMax();   // a deep link to #agent lands here first
   } else {
     agentMessage(!r.listening ? `The relay is not listening yet: ${r.error || 'waiting for its address'}.`
+               : d.remote ? `OpenCode on Uba is unreachable${sv.error ? ` (${sv.error})` : ''}. Check the Uba service and its LAN reverse SSH tunnel. The panel reconnects by itself.`
                : !unitOn ? `The opencode server is ${u.active === 'failed' ? 'failed' : 'stopped'}. Start it from a terminal (sudo systemctl start ${AGENT_UNIT}) or read its journal in the Logs tab.`
                : `The opencode server is not answering yet${sv.error ? ` (${sv.error})` : ''}. The panel reconnects by itself.`, null);
   }

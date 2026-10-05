@@ -122,11 +122,23 @@ def basic_auth(user: str, password: str) -> str:
 
 
 def read_credentials(path: Path) -> tuple[str, str] | None:
-    """The env file the opencode unit reads (KEY=VALUE lines, optional quotes)."""
+    """Read server auth from this project's env file or OpenCode's service JSON."""
     try:
         text = Path(path).read_text()
     except OSError:
         return None
+    if Path(path).suffix.lower() == ".json":
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        password = data.get("password")
+        if not isinstance(password, str) or not password:
+            return None
+        username = data.get("username", "opencode")
+        return (username if isinstance(username, str) and username else "opencode", password)
     kv = {}
     for line in text.splitlines():
         line = line.strip()
@@ -140,11 +152,12 @@ def read_credentials(path: Path) -> tuple[str, str] | None:
     return kv.get("OPENCODE_SERVER_USERNAME") or "opencode", pw
 
 
-def forward_request_headers(items, upstream_host: str, auth: str,
+def forward_request_headers(items, upstream_host: str, auth: str | None,
                             websocket: bool = False) -> list[tuple[str, str]]:
     out = [(k, v) for k, v in items if k.lower() not in REQUEST_DROP]
     out.append(("Host", upstream_host))
-    out.append(("Authorization", auth))
+    if auth:
+        out.append(("Authorization", auth))
     if websocket:
         out.append(("Connection", "Upgrade"))
         out.append(("Upgrade", "websocket"))
@@ -237,6 +250,8 @@ class RelayConfig:
     credentials: Callable[[], tuple[str, str] | None]      # (user, password) or None
     is_authed: Callable[[str | None], bool]                # Cookie header -> valid session?
     cockpit_port: int                                      # for frame-ancestors and the sign-in hint
+    allow_no_upstream_auth: bool = False                    # remote mode: SSH tunnel + loopback only
+    health_path: str = "/global/health"                    # v1 health or v2 service info
 
     @property
     def upstream_host(self) -> str:
@@ -244,21 +259,28 @@ class RelayConfig:
 
 
 def health(cfg: RelayConfig, timeout: float = 3.0) -> dict:
-    """GET /global/health on the upstream with the credentials: what the Agent
-    panel shows as the server state."""
+    """GET the configured health/info endpoint with the upstream credentials: what the Agent
+    panel shows as the server state, local or remote."""
     creds = cfg.credentials()
-    if not creds:
+    if not creds and not cfg.allow_no_upstream_auth:
         return {"healthy": False, "error": "no credentials file"}
     conn = http.client.HTTPConnection(*cfg.upstream, timeout=timeout)
     try:
-        conn.request("GET", "/global/health", headers={"Authorization": basic_auth(*creds)})
+        headers = {"Authorization": basic_auth(*creds)} if creds else {}
+        conn.request("GET", cfg.health_path, headers=headers)
         resp = conn.getresponse()
         raw = resp.read(4096)
         if resp.status == 401:
-            return {"healthy": False, "error": "credentials refused (restart opencode-web.service after editing the env file)"}
+            return {"healthy": False, "error": ("upstream requires Basic credentials" if not creds
+                                                else "upstream credentials refused")}
         if resp.status != 200:
             return {"healthy": False, "error": f"HTTP {resp.status}"}
         data = json.loads(raw or b"{}")
+        if cfg.health_path == "/api/info":
+            # OpenCode v2's service-info route is authenticated and returns the
+            # running PID/version, with no separate `healthy` field.
+            return {"healthy": bool(data.get("version") and data.get("pid")),
+                    "version": data.get("version")}
         return {"healthy": bool(data.get("healthy")), "version": data.get("version")}
     except (OSError, http.client.HTTPException, ValueError) as e:
         return {"healthy": False, "error": f"{type(e).__name__}: {str(e)[:80]}"}
@@ -269,11 +291,12 @@ def health(cfg: RelayConfig, timeout: float = 3.0) -> dict:
 def upstream_json(cfg: RelayConfig, path: str, timeout: float = 3.0):
     """One authenticated GET on the upstream, parsed; None when it cannot be had."""
     creds = cfg.credentials()
-    if not creds:
+    if not creds and not cfg.allow_no_upstream_auth:
         return None
     conn = http.client.HTTPConnection(*cfg.upstream, timeout=timeout)
     try:
-        conn.request("GET", path, headers={"Authorization": basic_auth(*creds)})
+        headers = {"Authorization": basic_auth(*creds)} if creds else {}
+        conn.request("GET", path, headers=headers)
         resp = conn.getresponse()
         raw = resp.read(1024 * 1024)
         if resp.status != 200:
@@ -334,9 +357,9 @@ def make_handler(cfg: RelayConfig) -> type[http.server.BaseHTTPRequestHandler]:
             if asset:
                 return self.serve_asset(asset)
             creds = cfg.credentials()
-            if not creds:
-                return self.refuse(503, "agent credentials missing on the box (run dashboard/install-agent.sh)")
-            auth = basic_auth(*creds)
+            if not creds and not cfg.allow_no_upstream_auth:
+                return self.refuse(503, "agent upstream credentials are not configured on this box")
+            auth = basic_auth(*creds) if creds else None
             if self.headers.get("Upgrade", "").lower() == "websocket":
                 return self.tunnel(auth)
             if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
@@ -394,7 +417,7 @@ def make_handler(cfg: RelayConfig) -> type[http.server.BaseHTTPRequestHandler]:
             self.send_header("Referrer-Policy", "no-referrer")
 
         # ---- plain HTTP, streamed ----
-        def forward(self, auth: str, body: bytes):
+        def forward(self, auth: str | None, body: bytes):
             conn = http.client.HTTPConnection(*cfg.upstream, timeout=CONNECT_TIMEOUT)
             try:
                 conn.connect()
@@ -410,7 +433,7 @@ def make_handler(cfg: RelayConfig) -> type[http.server.BaseHTTPRequestHandler]:
                 resp = conn.getresponse()
             except (OSError, http.client.HTTPException) as e:
                 conn.close()
-                return self.refuse(502, f"agent server unreachable ({type(e).__name__}); is opencode-web.service running?")
+                return self.refuse(502, f"agent upstream unreachable ({type(e).__name__})")
             rewrite = wants_html_rewrite(self.command, resp.status,
                                          resp.getheader("Content-Type"),
                                          resp.getheader("Content-Encoding"),
@@ -496,11 +519,11 @@ def make_handler(cfg: RelayConfig) -> type[http.server.BaseHTTPRequestHandler]:
                 conn.close()
 
         # ---- WebSocket (the terminal panel) ----
-        def tunnel(self, auth: str):
+        def tunnel(self, auth: str | None):
             try:
                 up = socket.create_connection(cfg.upstream, timeout=CONNECT_TIMEOUT)
             except OSError as e:
-                return self.refuse(502, f"agent server unreachable ({type(e).__name__})")
+                return self.refuse(502, f"agent upstream unreachable ({type(e).__name__})")
             self.close_connection = True
             try:
                 up.settimeout(CONNECT_TIMEOUT)

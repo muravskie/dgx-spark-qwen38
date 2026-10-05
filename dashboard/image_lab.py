@@ -64,7 +64,9 @@ def history_summary(history):
         rows.append({"model": model, "status": state, "duration_seconds": duration,
                      "finished_ms": ended or (prompt[3].get("create_time") if isinstance(prompt, list) and len(prompt) > 3 and isinstance(prompt[3], dict) else None)})
     rows.sort(key=lambda row: row["finished_ms"] or 0, reverse=True)
+    window_starts = [row["finished_ms"] for row in rows if row["finished_ms"] is not None]
     return {"last": rows[0] if rows else None,
+            "window_started_ms": min(window_starts) if window_starts else None,
             "sample_size": len(rows),
             "successful": sum(row["status"] == "success" for row in rows),
             "failed": sum(row["status"] not in (None, "success") for row in rows)}
