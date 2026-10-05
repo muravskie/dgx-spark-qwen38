@@ -137,7 +137,7 @@ if [ "$BIND" != "127.0.0.1" ] && [ "$BIND" != "localhost" ] && [ "$BIND" != "::1
     || echo "WARNING: $HOME/.config/qwen38/api-key is missing or empty, so nobody can log in."
 fi
 if [ "$AGENT_PORT" != "0" ]; then
-  if [ "$AGENT_REMOTE" = 1 ]; then
+  if [ "${AGENT_REMOTE:-0}" = 1 ]; then
     echo "Agent relay: $AGENT_BIND:$AGENT_PORT -> $AGENT_UPSTREAM (remote OpenCode via loopback SSH tunnel; a cockpit session is required)"
   else
     echo "Agent relay: $AGENT_BIND:$AGENT_PORT -> $AGENT_UPSTREAM (Agent tab; a cockpit session is required)"

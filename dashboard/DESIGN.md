@@ -367,4 +367,3 @@ What the phone taught the day after (2026-09-30), found with the reference box's
 - **A check that clicks from script proves nothing about a finger.** `element.click()`
   ignores what covers the element; `touch-check.mjs` sends real touch events where a finger
   lands and audits every control of every view for anything covering it.
-

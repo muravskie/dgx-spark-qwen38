@@ -46,10 +46,6 @@ installed_dash(){ { grep -m1 -E "^Environment=$1=" "$DASH_UNIT_PATH" 2>/dev/null
 if [ -z "${OPENCODE_PORT:-}" ] && [ -f "$INSTALLED_OC" ]; then
   OPENCODE_PORT="$(sed -n 's/^ExecStart=.* --port \([0-9][0-9]*\).*/\1/p' "$INSTALLED_OC" | head -1)"
 fi
-if [ "$(installed_dash COCKPIT_AGENT_REMOTE)" = 1 ]; then
-  printf '%s\n' 'ERROR: this cockpit uses remote OpenCode. Update the relay with dashboard/install-dashboard.sh; manage OpenCode on Uba.' >&2
-  exit 1
-fi
 RELAY_PORT_INSTALLED="$(installed_dash COCKPIT_AGENT_PORT)"
 if [ -n "$RELAY_PORT_INSTALLED" ] && [ "$RELAY_PORT_INSTALLED" != 0 ]; then
   AGENT_PORT="${AGENT_PORT:-$RELAY_PORT_INSTALLED}"
@@ -65,6 +61,11 @@ note(){ printf 'NOTE: %s\n' "$*"; }
 # ALLOW_ROOT=1 is for a box whose only login is root.
 if [ "$(id -u)" = "0" ] && [ "${ALLOW_ROOT:-0}" != "1" ]; then
   die "run this as the user who will use the box, not as root: it calls sudo itself for the steps that need it${SUDO_USER:+ (your login is $SUDO_USER: drop the sudo)}."
+fi
+
+if [ "$(installed_dash COCKPIT_AGENT_REMOTE)" = 1 ]; then
+  printf '%s\n' 'ERROR: this cockpit uses remote OpenCode. Update the relay with dashboard/install-dashboard.sh; manage OpenCode on Uba.' >&2
+  exit 1
 fi
 
 [[ "$OPENCODE_PORT" =~ ^[0-9]+$ ]] || die "OPENCODE_PORT must be a number"

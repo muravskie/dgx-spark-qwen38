@@ -74,7 +74,7 @@ that script with `AGENT_BIND=`.
   the cockpit runs a real generation canary and reports `ready`, `loading`,
   `wedged` or `stopped` from that, with the served checkpoint named from the
   unit rather than guessed.
-- **Token rates.** The Overview tab reads SGLang's metrics endpoint for current
+- **Token rates.** The Now view reads SGLang's metrics endpoint for current
   uncached prefill, cached prompt processing, and generation tok/s. It also
   shows a median over the last ten telemetry windows. This is deliberately a
   window median, not a per-request median: the engine does not expose request
