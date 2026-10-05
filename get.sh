@@ -72,8 +72,18 @@ main() {
     *) echo "ERROR: $DIR is not a clone of this repo (origin: ${DIR_ORIGIN:-none}). Refusing to touch it." >&2; exit 1 ;;
   esac
 
+  # Check the local handoff before an upstream reset could remove this guard.
+  if [ -f "$DIR/controller-ownership.py" ]; then
+    python3 "$DIR/controller-ownership.py" || exit 1
+  fi
   echo "── Repo: $DIR"
   git -C "$DIR" fetch -q origin main
+  # The release tags too. A fetch of main alone brings none, and the cockpit's release check
+  # and `git describe` read them: a box updated by this command kept naming the release it
+  # was first cloned at (v1.19.0 on the reference box running v1.20.1, 2026-10-01). A tag of
+  # the same name made on this box is kept, and the update goes on.
+  git -C "$DIR" fetch -q --tags origin 2>/dev/null \
+    || echo "── NOTE: the release tags did not all come (a tag of the same name exists here?); the update goes on"
 
   # Must be on main (a detached HEAD or a side branch would silently pin an old version).
   CUR=$(git -C "$DIR" symbolic-ref -q --short HEAD || echo DETACHED)

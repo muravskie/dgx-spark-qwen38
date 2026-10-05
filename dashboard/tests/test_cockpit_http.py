@@ -209,7 +209,8 @@ class Unauthenticated(Base):
         before, _ = self.routes("do_GET", "do_POST")
         self.assertEqual(before, self.PUBLIC_GET)
         before, _ = self.routes("do_POST", "serve_static")
-        self.assertEqual(before - {"/api/image/edit", "/api/image/generate"}, self.PUBLIC_POST)
+        self.assertEqual(before - {"/api/image/edit", "/api/image/generate",
+                                   "/api/video/generate"}, self.PUBLIC_POST)
 
     def test_every_route_behind_the_session_check_refuses_without_one(self):
         _, get = self.routes("do_GET", "do_POST")
@@ -255,6 +256,36 @@ class AStalledReaderDoesNotHoldTheState(Base):
         finally:
             s.close()
         self.assertTrue(got, "a reader that stalls holds the lock every sampler publishes under")
+
+
+class ARefusalBeforeTheBodyReachesTheClient(Base):
+    """A refusal the cockpit sends before it reads a body (a body past its route's cap, a
+    POST with no session) went out and the socket closed at once: the rest of the upload met
+    a reset, and a client that stops at its failed write, as Python's http.client does, saw a
+    broken pipe instead of the answer (found 2026-10-02). The proxy drains such a body since
+    2026-09-24 (tests/test_proxy_refusal_reaches_client.py)."""
+
+    def big_post(self, path, size):
+        got = []
+        for _ in range(5):
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+            try:
+                c.request("POST", path, b"x" * size, {"Content-Type": "application/json"})
+                r = c.getresponse()
+                got.append((r.status, r.read()[:60]))
+            except OSError as e:
+                got.append((type(e).__name__, b""))
+            finally:
+                c.close()
+        return got
+
+    def test_a_login_body_past_its_cap_gets_its_413(self):
+        got = self.big_post("/api/login", 12 * 1024 * 1024)
+        self.assertEqual([g[0] for g in got], [413] * 5, got)
+
+    def test_a_big_post_with_no_session_gets_its_401(self):
+        got = self.big_post("/api/image/generate", 20 * 1024 * 1024)
+        self.assertEqual([g[0] for g in got], [401] * 5, got)
 
 
 class Login(Base):
@@ -319,7 +350,7 @@ class Cookies(Base):
         self.assertEqual(st, 403, json.loads(data or b"{}"))
 
     def test_an_expired_session_is_rejected(self):
-        old = f"sess:{int(time.time()) - 13 * 3600}"
+        old = f"sess:{int(time.time()) - self.cp.SESSION_MAX_AGE - 60}"
         import hashlib
         import hmac
         sig = hmac.new(self.cp.SESSION_SECRET, old.encode(),
@@ -651,6 +682,7 @@ class ReadRoutes(Base):
         self.assertEqual(set(self.cp.CONTAINERS), {"qwen38-sglang", "qwen38-flash"})
         self.assertEqual(set(self.cp.JOURNAL_UNITS), {
             "qwen38-sglang.service", "qwen38-flash.service", "qwen38-image.service",
+            "qwen38-video.service",
             "qwen38-keepalive.service", "opencode-web.service"})
 
     def test_a_known_log_source_answers_with_bounded_lines(self):
@@ -693,7 +725,7 @@ class ReadRoutes(Base):
     # What only each page has: the login form, and the app's lane selector. "<" and the
     # product name are in both, so either page passed for the other (found in review,
     # 2026-09-24).
-    LOGIN_MARK, APP_MARK = b'<form class="card" id="f">', b'id="switchsel"'
+    LOGIN_MARK, APP_MARK = b'<form class="gate" id="f">', b'id="serving"'
 
     def test_the_root_serves_the_login_page_without_a_session(self):
         st, _, body = self.req("GET", "/")
@@ -917,14 +949,30 @@ class UpdateCheck(Base):
         for bad in ("main", "", None, "v1.15.2-rc1", "latest"):
             self.assertIsNone(self.cp._semver(bad), bad)
 
-    def _with_latest(self, tag, installed="v1.15.0"):
+    def _with_latest(self, tag, installed="v1.15.0", described="v1.0.0"):
+        """`installed` is the release the checkout's CHANGELOG names; `described` is what
+        its tags say, which since v1.20.2 the check reads only when the file names none."""
         self.cp._get_json = lambda url, timeout=5.0: {"tag_name": tag}
-        real_run = self.cp.run
-        self.cp.run = lambda argv, **k: installed if "describe" in argv else real_run(argv, **k)
+        real_run, real_release = self.cp.run, self.cp._release
+        self.cp.run = lambda argv, **k: described if "describe" in argv else real_run(argv, **k)
+        self.cp._release = lambda: installed.lstrip("v") if installed else "unknown"
         try:
             return self.cp.collect_update()
         finally:
-            self.cp.run = real_run
+            self.cp.run, self.cp._release = real_run, real_release
+
+    def test_the_release_a_box_runs_is_the_one_its_files_name_not_its_tags(self):
+        """get.sh fetched main and no tag, so a box updated by the one-liner described
+        itself as the release it was first cloned at, and the cockpit announced the release
+        it ran as an update (v1.19.0 on the reference box running v1.20.1, 2026-10-01)."""
+        out = self._with_latest("v1.20.1", installed="v1.20.1", described="v1.19.0")
+        self.assertEqual(out["installed"], "v1.20.1")
+        self.assertFalse(out["behind"])
+
+    def test_a_checkout_that_names_no_release_falls_back_on_its_tags(self):
+        out = self._with_latest("v1.20.1", installed="", described="v1.19.0")
+        self.assertEqual(out["installed"], "v1.19.0")
+        self.assertTrue(out["behind"])
 
     def test_a_newer_published_release_is_reported_as_behind(self):
         out = self._with_latest("v1.15.2")
@@ -1002,13 +1050,13 @@ class UpdateCheck(Base):
 
     def test_code_older_than_the_files_on_disk_is_reported(self):
         self.cp.CODE_AT_START = dict(self.cp.code_fingerprint())
-        self.cp.CODE_AT_START["static/app.js"] = "0:0"
+        self.cp.CODE_AT_START["static/js/base.js"] = "0:0"
         self.cp.UPDATE_CHECK = False
-        self.assertIn("static/app.js", self.cp.collect_update().get("stale_code", []))
+        self.assertIn("static/js/base.js", self.cp.collect_update().get("stale_code", []))
 
 
 class SystemOneRoute(Base):
-    """The System One tab is a browser sending someone else's state to a lane. Two
+    """The Decide tab is a browser sending someone else's state to a lane. Two
     things matter and neither is the answer: the serving key never leaves this process,
     and the browser cannot choose anything but the state and the questions."""
 

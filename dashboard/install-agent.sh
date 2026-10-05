@@ -46,6 +46,10 @@ installed_dash(){ { grep -m1 -E "^Environment=$1=" "$DASH_UNIT_PATH" 2>/dev/null
 if [ -z "${OPENCODE_PORT:-}" ] && [ -f "$INSTALLED_OC" ]; then
   OPENCODE_PORT="$(sed -n 's/^ExecStart=.* --port \([0-9][0-9]*\).*/\1/p' "$INSTALLED_OC" | head -1)"
 fi
+if [ "$(installed_dash COCKPIT_AGENT_REMOTE)" = 1 ]; then
+  printf '%s\n' 'ERROR: this cockpit uses remote OpenCode. Update the relay with dashboard/install-dashboard.sh; manage OpenCode on Uba.' >&2
+  exit 1
+fi
 RELAY_PORT_INSTALLED="$(installed_dash COCKPIT_AGENT_PORT)"
 if [ -n "$RELAY_PORT_INSTALLED" ] && [ "$RELAY_PORT_INSTALLED" != 0 ]; then
   AGENT_PORT="${AGENT_PORT:-$RELAY_PORT_INSTALLED}"
@@ -88,7 +92,7 @@ if [ -z "${AGENT_BIND:-}" ]; then
   case "$COCKPIT_BIND" in
     127.0.0.1|localhost|::1)
       AGENT_BIND=127.0.0.1
-      note "the cockpit listens on loopback only, so the relay does too: the Agent tab works on this box."
+      note "the cockpit listens on loopback only, so the relay does too: the Agent view works on this box."
       note "to use it from your laptop: DASH_BIND=0.0.0.0 dashboard/install-dashboard.sh (or DASH_BIND=\$(tailscale ip -4)), then re-run this script." ;;
     0.0.0.0|tailscale|"$TS_IP")
       AGENT_BIND=tailscale ;;
@@ -163,6 +167,7 @@ stale_since(){
 
 # ── render and install the unit ────────────────────────────────────────────
 TMP_UNIT="$(mktemp)"
+trap 'rm -f "$TMP_UNIT"' EXIT   # however this ends, as install-dashboard.sh does
 sed -e "s|__USER__|$(id -un)|g" -e "s|__GROUP__|$(id -gn)|g" -e "s|__HOME__|$HOME|g" \
     -e "s|__OPENCODE_BIN__|$OPENCODE_BIN|g" -e "s|__OPENCODE_PORT__|$OPENCODE_PORT|g" \
     -e "s|__PATH__|$SVC_PATH|g" -e "s|__OUTPUT_TOKEN_MAX__|$OUT_MAX|g" \
@@ -212,7 +217,7 @@ if [ -n "$RELAY_HOST" ]; then
   [ "$code" = "401" ] || die "the relay did not come up on $RELAY_HOST:$AGENT_PORT (got '$code'; journalctl -u qwen38-dashboard -n 30)"
   echo "agent relay: http://$RELAY_HOST:$AGENT_PORT refuses without a cockpit session (401), as it should"
   echo
-  echo "Agent tab: http://$RELAY_HOST:$COCKPIT_PORT/#agent   (log in with the API key; the tab needs no second login)"
+  echo "Agent view: http://$RELAY_HOST:$COCKPIT_PORT/#agent   (log in with the API key; the view needs no second login)"
 else
   echo "agent relay: binds the tailnet address when tailscale is up; then open http://<tailnet address>:$COCKPIT_PORT/#agent"
 fi

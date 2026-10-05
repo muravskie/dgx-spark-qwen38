@@ -1,5 +1,837 @@
 # Changelog
 
+## v1.22.6 (2026-10-03): the engine key masked everywhere in /server_info, a local CI that leaves nothing behind
+
+Proxy v6.32. SGLang's `/server_info` repeats the engine's whole command line in
+`launch_command`, the API key included, and the proxy took out only the key fields
+(`api_key`, `admin_api_key`): a client named in `QWEN38_CLIENT_KEYS_FILE` could read, through
+the proxy, the one secret the identity wall keeps from it. Without the wall the caller
+already holds that key, so only boxes that use the wall were exposed. The value of every key
+flag is now masked in every string of that answer, and the engine's own key wherever it
+shows; `ssl_keyfile_password` joins the key fields. Found by the audit of the flash recipe on
+2026-10-03, and checked on the reference box: through the proxy, the key was in
+`launch_command` and in no other answer (`/v1/loads`, `/v1/models`, `/metrics`,
+`/model_info`).
+
+Each step of `ci-local.sh` already ran under a HOME of its own, removed when it ended; it now
+gets a TMPDIR inside that HOME too. The suite's temporary directories, and its scripts'
+`mktemp`, stayed in /tmp after every local run: 761 of them on the reference box on
+2026-10-03, some with modification times in 2027 (a test that dates files after an engine's
+start), which read as files changed by whatever ran next on the box. The workflows' own steps
+also wrote fixed names there: twelve in `ci.yml` (the two coverage reports, the rendered
+units and flash launchers, the pin blocks, an error capture, the opencode test config) and
+pin-watch's report, which `tests/test_check_pins.py` runs as written. Every local run left
+them behind, and any second run beside it wrote over them: they now go under
+`${TMPDIR:-/tmp}`, and a new step fails CI on a fixed path in /tmp in any workflow. A full
+local run now leaves /tmp as it found it. Nothing changes on GitHub's runners, which set no
+TMPDIR and start empty.
+
+The installers left files of their own in /tmp: `dashboard/install-dashboard.sh`,
+`dashboard/install-agent.sh` and `install.sh` render each unit (and the flash launch script)
+into a temporary file and removed it only on the way that succeeds, so a run that stopped in
+between left it there. They now remove it however they end. Two tests gave a child an
+environment of its own, without TMPDIR, so what the child created went to /tmp whatever
+`ci-local.sh` had set: one passes TMPDIR now, the other makes the directory itself and
+removes it. `dashboard/tests/smoke-http.sh` also removes its second cookie jar, which holds a
+cockpit session.
+
+The step that checks the offline suite leaves nothing behind compared every listener of the
+machine before and after the suite, and failed twice on the reference box on 2026-10-03 for
+ports opened or closed while the suite ran: VS Code's own log named one of the first two, and
+a log of every listener and its owner, kept each second, named VS Code for both of the
+second, a run in which the suite itself left nothing. The suite now runs under
+`tests/suite_reaper.py`, a child subreaper: every process it starts stays its descendant,
+whatever session or environment that process gives itself, so what still runs once the suite
+is over is the suite's own. It is named with the sockets it listens on, stopped, and fails
+the step, a process left running without a socket included. Other programs' listeners are
+shown, and fail the step on a GitHub runner only, where nothing else runs.
+
+TESTING.md said what `ci-local.sh` did two versions ago: it now says where the test venv is
+looked for (`QWEN38_TEST_PYTHON` first, which a fresh clone needs, or the four steps that use
+`coverage` or `hypothesis` are skipped), how a step is skipped (a missing tool it calls, a
+package it cannot provide), and how long a full run took in October 2026.
+
+An update restarts the proxy and the cockpit; the engines keep running.
+
+## v1.22.5 (2026-10-03): a stream the engine has not started is kept open, and its caller watched
+
+In the night of 2 to 3 October an opencode session on the flash lane started eight
+sub-agents at once, and by the morning the engine's queue held 163 requests for those eight
+agents. SGLang sends a stream's status and headers with its first chunk, after the request
+waited in the queue and its prompt was computed (`_handle_streaming_request` in
+`serving_chat.py`, in the images of both lanes). The eight agents' contexts outgrew the KV
+pool (771,301 tokens at 01:00 against 437,184), so the engine ran 3 to 5 requests at a time
+and computed most prompts again at each turn, and the wait grew past 300 s. opencode 1.18.32
+waits 300 s for a response's headers (`headerTimeout`, its default), then gives up and sends
+the request again. The proxy relayed the engine's headers when they came, wrote nothing
+before them and did not watch the caller of a stream meanwhile, so each request opencode gave
+up on stayed queued until its turn, had its prompt computed for nobody, and was aborted at
+the proxy's first write. From 00:12 to 11:36, 950 requests went through the proxy and 238
+were answered, the last at 05:43; opencode logged 704 header timeouts and sent each of those
+requests again, and from 02:15 to 11:36 the engine computed 47,939,516 prompt tokens and
+decoded 18,807.
+
+**The proxy keeps a stream the engine has not started (v6.31).** Until the engine answers,
+the caller of a stream is watched, as the caller of a non-streamed answer already was: when
+it leaves, its request is aborted by rid where the engine allows it and the upstream
+connection is closed, which SGLang sees within 4 s and answers by aborting the request
+itself. After 10 s (`KEEPALIVE_S`) with no headers from the engine, the proxy opens the
+stream (200 and its headers, as a hold does since v6.28) and writes role 1's keepalives into
+it until the engine answers: the client waits as long as the engine needs, and a client that
+has gone is found at the next write. An engine that answers before then is relayed as
+before, its own status and headers included, so a quick refusal keeps its 400; a refusal or
+a stopping engine after it is an error event of the stream, as in a hold. Past
+`MAX_SILENCE_S` (3,600 s) with nothing from the engine, the request is dropped, as a silent
+stream is.
+
+Measured:
+
+- the real opencode 1.18.32, against an engine that holds its headers 320 s (a fake one, as
+  SGLang does behind a queue): through v6.30, opencode gave up at 300 s
+  (`ProviderHeaderTimeoutError: Provider response headers timed out after 300000ms`) and
+  sent the request again at 303.8 s and 608.7 s, while the engine answered each earlier copy
+  320 s after it came, to nobody, and opencode had no answer when it was stopped at 760 s;
+  through v6.31, the stream opened at 10 s and opencode took the answer at 322 s, exit code
+  0, one request;
+- the flash lane itself, with a prompt of about 150,000 tokens its cache had never seen:
+  the status came at 10.0 s, then a keepalive every 10 s, and the first token at 76.5 s. A
+  client that left at 25 s had its request aborted at once, with about 99,000 of its prompt
+  tokens not yet computed; through v6.30 the same departure went unnoticed until the
+  engine's first token at 76.6 s, about 50 s of prefill for nobody;
+- `tests/test_proxy_engine_withholds_headers.py`: 10 tests with a fake engine that holds
+  its headers back as SGLang does; 7 fail on v6.30.
+
+opencode's own 300 s stays as it is: through the proxy the headers now come at 10 s, so it
+cannot fire on a stream, and every request opencode sent that night was one.
+
+**Several agents share one pool.** The proxy no longer lets a request nobody waits for take
+the engine's time, but eight agents still do not fit in a pool that holds four: once their
+contexts add up to more than the pool, each turn computes its whole prompt again. The
+night's counters and the rule (keep the sum of the agents' contexts under the pool shown on
+the cockpit's Lanes page) are in [docs/flash-lane.md](docs/flash-lane.md), "Several agents
+at once".
+
+The CI step that checks the offline suite touches nothing ran each test file with its output
+thrown away, so its one red run of this release said only `tests/test_proxy_hold.py failed`.
+The same file then passed 82 times (48 on the reference box, 34 on GitHub runners), so what
+failed is not known. A file that fails there now prints the end of its output.
+
+An update restarts the proxy once (v6.31) and the cockpit; the engines keep running.
+
+## v1.22.4 (2026-10-03): the Traffic badge counts every request in flight
+
+The badge beside Traffic in the rail, and the "in flight" rows of the Requests table, count
+the feed's rows, and the feed held the 25 newest requests through the proxy. With eight
+agents at work, a generation that outlasted 25 newer requests left both while the engine
+still ran it: on the reference box, eight agents read "8 running" beside a badge that fell
+to 7, then 5, 4 and 2, while the proxy had 8 requests in flight (measured 2026-10-02; one
+request lasted 34 minutes). The feed now keeps every older request still in flight beside
+the 25 newest, and carries what was in flight at one read into the next, so a long
+generation stays counted after its start has left the 800 journal lines read every 5 s.
+The first read after the cockpit starts goes back to the proxy's own start, so a cockpit
+restarted under a long generation counts it too. The page is unchanged: it counts the rows
+it is sent.
+
+An update restarts the cockpit; the engines and the proxy keep running.
+
+## v1.22.3 (2026-10-02): the Logs view gives the engine's times in the box's own time, and dims the box's own polling
+
+The serving containers run in UTC, and the Logs view showed their lines as they come: in
+Luxembourg, two hours behind every other time on the page (a line stamped 16:37 at 18:37 on
+the reference box). The cockpit now reads each line's instant from its transport, docker's
+`--timestamps` or the journal's own, and rewrites a leading `[YYYY-MM-DD HH:MM:SS]` that is
+that instant written in UTC in the box's local time. A stamp that is not (a lane that runs
+natively, a time a line quotes) stays as it was, and the view says when it rewrote any. The
+engine is not touched: nothing it reads changes, so nothing restarts it.
+
+The cockpit asks the engine its load every second, and those lines filled the whole engine
+log while only `/health` was dimmed. The cockpit's own routes, `/v1/loads` and `/server_info`
+and their older names, are dimmed too now.
+
+The monkey check counted jobs to see that a confirm storm starts one: the server keeps the
+last five, so a count stood still on a cockpit with five behind it, and the check read the
+state, sampled once a second, a single time 1.5 s after the clicks, which missed a job that
+had started (one run in four on a cockpit reading the reference box). It tells jobs apart by
+their id now, and waits for the one it expects. And the test of the start guard's lines
+failed once in a full local CI run: it gave the guard 1 s, which the guard counts in whole
+seconds, so a first look that ended past the shell's first second refused at once, with no
+line saying it waited (reproduced with an `nvidia-smi` that answers in 1.2 s). It gives the
+guard 3 s; the service's own wait is 60 s.
+
+An update restarts the cockpit; the engines and the proxy keep running.
+
+## v1.22.2 (2026-10-02): the Cockpit panel of Settings no longer reads stale
+
+Since the redesign of 2026-09-30, the Cockpit panel of Settings (the cockpit's version, its
+mode, the usable pool share, the refresh periods) read "stale" under a dashed border 18 s
+after every start, on every box, with the cockpit's uptime for an age ("stale, 2 h 18 old"
+on the reference box in the hour before v1.22.1 went on it, "stale, 78 s old" right after).
+The panel was watched as a live source, and its facts are the process's own, set once at its
+start: nothing samples them, so nothing could keep them fresh. The panel shows its facts
+without an age now, and a test holds every panel to a source the server samples: both of its
+tests fail on v1.22.1.
+
+An update restarts the cockpit; the engines and the proxy keep running.
+
+## v1.22.1 (2026-10-02): omp's own dialect passes the proxy, the pin watch asks GitHub with a token, and the cockpit says what it could not read
+
+What a campaign of tests on the reference box found on v1.22.0, every request kind through
+the proxy, the real agents, and the cockpit clicked, reloaded and starved of its sources.
+
+**omp's default dialect passes the proxy (v6.30).** omp sends the effort both at the top of
+a request and in `chat_template_kwargs`. SGLang takes the `chat_template_kwargs` copy first,
+but validates the top-level one against its own enum, so the template's `lean`, omp's
+default level here, was a 400 on every request for an omp configured by hand (v1.22.0's
+generated config avoids it with `thinkingFormat: qwen-chat-template`). The proxy now drops
+the top-level copy when SGLang would refuse it and `chat_template_kwargs` names a level: the
+level that applies is the one that would have applied. A top-level level SGLang accepts is
+left alone, and a `null` in `chat_template_kwargs`, which SGLang skips, is filled as an
+absent one is. Checked with omp 18.4.9 in its default dialect against the flash lane: a 400
+through v6.29, an answer through v6.30.
+
+**The pin watch asks GitHub with the workflow's token.** The scheduled pin watch of
+2026-10-02 filed [issue #34](https://github.com/hasso5703/dgx-spark-qwen38/issues/34): both
+of its tries, ten minutes apart, got HTTP 403 from the GitHub API with the rate limit spent,
+and said so ("3 of 18 pins could not be asked about"), as v1.21.0 made it. GitHub allows an
+anonymous caller 60 requests an hour per address, and a runner's address is shared with
+other jobs. The watch now hands `check-pins.sh` the workflow's own token (`GITHUB_TOKEN`),
+which it sends to the GitHub API the way it sends `HF_TOKEN` to Hugging Face: on stdin,
+never on a command line (checked on the reference box: the token on no process's command
+line during a run). Without the variable, as on a box, nothing changes.
+
+**The cockpit answers a refused upload before it closes.** A POST past its cap (4 KiB for the
+login, 40 MiB for an image, 10 MiB for a video, 64 KiB elsewhere), sent without a session or
+with a Content-Length that is not a number got its 413, 401 or 400 written and the connection
+closed with the body unread: a client still sending, like Python's `http.client`, met a reset
+and saw a broken pipe instead of the answer, five times in five. The cockpit now ends its
+side and reads what is left for up to 10 s, as the proxy has done since 2026-09-24, and the
+client reads its answer.
+
+**The cockpit says what it could not read.** A field reads "…" while its value is on its
+way; several kept it for good, or said something that was never read:
+
+- With no text engine serving, the Traffic counters read "…"; they read "none", beside the
+  "no text engine" they already showed (the page before the redesign of 2026-09-30 said so).
+- With `nvidia-smi` silent, the GPU vitals of Now read "…", beside a temperature called
+  "cool" and "0 processes", and the Machine view said "No process on the GPU" under a green
+  lamp, its power line falling to 0 W. They read "n/a" now, and the Machine view says that
+  `nvidia-smi` did not answer.
+- A kernel log read that did not answer (a `journalctl` past its 8 s) counted as a quiet
+  hour, "0", and became the baseline the next read is measured against: every GPU driver
+  refusal of the hour then came back as a new event (reproduced with v1.22.0's collector).
+  It is no reading now ("n/a"), and the baseline stays.
+- With no lane enabled at boot, the spine said "27B starts at boot", and Load left out the
+  step that makes the lane it loads the boot one. It says "no lane starts at boot" (nothing,
+  when systemd did not answer), and Load points the boot at the lane as it does from any
+  other.
+- A lane whose launch file names no checkpoint read "Checkpoint …" in Lanes; "unknown". And
+  when systemd did not answer, a lane the lifecycle does not list (a diffusion lane with no
+  unit file) showed as installed, its checkpoint "…": the lifecycle's list decides then.
+
+**Two browser checks run in CI.** `dashboard/tests/update-banner-check.mjs` called functions
+the redesign of 2026-09-30 renamed and failed 7 of its 9 checks on every cockpit since,
+unseen, since it ran nowhere; `monkey-check.mjs` documented a run on port 30091, a box's
+agent relay. Both now own a dry-run cockpit of their own, like the resilience and touch
+checks, and run in CI: the monkey check is the one that found the fields above. And the
+four checks that own a cockpit no longer leave it running when they end early. The CI and the
+pin watch run on a named image, `ubuntu-24.04`, which `ubuntu-latest` leaves for Ubuntu 26
+from 2026-10-19, and on `actions/checkout@v5`, which runs on Node 24.
+
+An update restarts the proxy once (v6.30) and the cockpit; the engines keep running.
+
+## v1.22.0 (2026-10-02): pi and omp configs, generated from the opencode artifact
+
+[pi](https://pi.dev) and [omp](https://omp.sh) (oh-my-pi) read no `opencode.json`, so the box's facts (the providers, the default model, the limits, the template's effort tiers) existed for them only if a user typed them again. `./pi-gen.py` derives both agents' configs from the artifact install.sh already fits: `~/.config/qwen38/pi/` (pi's JSON pair, canonical) and `~/.config/qwen38/omp/` (the same values in omp's YAML), built once so they cannot disagree. The repo never writes into `~/.pi` or `~/.omp`: copying stays the user's, and `docs/pi.md` says how without overwriting a config that has other providers. Contributed by [@jimkont](https://github.com/jimkont) in [#30](https://github.com/hasso5703/dgx-spark-qwen38/pull/30).
+
+Checked with the real agents before it was merged, through the proxy to the flash lane, and two changes came out of it:
+
+- **pi's system prompt goes out as `system`.** pi sends it as the `developer` role to a reasoning model on a provider it does not know, and the served chat template refuses that role: every request got 400 "Unexpected message role." (pi 0.99.2). Each generated model now carries `compat.supportsDeveloperRole: false`.
+- **omp's effort rides `chat_template_kwargs` alone.** omp's default dialect also copies the effort into a top-level `reasoning_effort`, which SGLang validates against `none`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max` in both lanes' images: the template's own `lean`, omp's default level here, was a 400 on every request (omp 18.4.9). The generated models now set `compat.thinkingFormat: qwen-chat-template`, omp's dialect for vLLM and SGLang.
+
+With both, pi and omp answered at every thinking level and made a tool call (`read`) each. Two smaller changes: the `!cat <path>` that reads the key is quoted for the shell both agents run it in, and the files are regenerated only on a box that asked for them once (`./pi-gen.py` made their directory), by a switch as before and now by a fit too (`oc-fit-limits.py`, the cockpit's button), whose limits they carry.
+
+**Claude Code's pair on the flash lane** ([docs/clients.md](docs/clients.md)). The pair it documented, `529000` with `max_tokens` at 250,000, is sized for the 27B in 1M mode, and on the flash lane's window of 262,144 tokens every streamed request passed it: the engine refused each inside its stream, and Claude Code sent it again without a stream, which it gave up on after about 6 minutes, so a long answer never came and the hold of v1.21.0 could not keep it alive (found by its end-to-end test on the installed release). On the flash lane the pair is `205000` with `max_tokens` at 32,000, opencode's limits there; with it, Claude Code's request streams again.
+
+## v1.21.1 (2026-10-02): a request whose body never arrived whole is not sent on
+
+The proxy's fuzz suite failed about one run in ten on its relay simulation, on v1.20.5
+already (2 of 15 runs there, 1 of 15 on v1.21.0), and it failed the check of pull request
+#30 on GitHub. Two things met in it. A caller that closed before the last byte of its body
+left the proxy a short read, and the proxy sent the engine what had come: of 300 requests
+closed with a reset at once after sending, 11 were read short and sent on all the same
+(measured with v1.21.0's proxy against an engine that counts what it gets). No engine can
+serve that, so nothing was ever generated from one, but no request should go out so: the
+proxy (v6.29) now ends it "CLIENT GONE before its body" and asks the engine nothing. And
+the suite's own engine fell over a body cut short, which is also what an engine sees when
+the proxy closes its side as a request goes out, its caller gone, by design: that engine
+now counts it as the request it never had, and the rule that a caller who left must never
+get a whole answer is checked as before. Over 30 runs each the simulation no longer fails,
+on either proxy, and `tests/test_proxy_short_body.py` pins the short read (two of its three
+tests fail on v1.21.0).
+
+An update restarts the proxy once (v6.29); the engines keep running.
+
+## v1.21.0 (2026-10-01): an engine restart no longer ends a session, and no engine starts on memory still held
+
+[Issue #26](https://github.com/hasso5703/dgx-spark-qwen38/issues/26) reported a 27B engine
+dying about once a day with `CUDA error: operation not permitted`, systemd starting it again
+17 s later, and the fear that this restart falls in the window
+[sglang#40948](https://github.com/sgl-project/sglang/issues/40948) blames for a DGX Spark
+frozen 9.5 h. The crash was not reproduced on the reference box (driver 580.178.04); everything
+around it was measured, and this release changes what a restart does to the box and to the
+clients. The whole account, with the settings, is in
+[docs/engine-restarts.md](docs/engine-restarts.md).
+
+**No engine starts on memory the last one has not given back.** On a healthy driver the
+restart is in no window: an emulated crash of the 27B 1M lane gave back its 92 GB in 2 to 5 s,
+and systemd started it again at +21 s, about 15 s later. sglang#40948 froze in the other case,
+a driver that kept a dead engine's memory while the next start piled on top. Every engine unit
+(27B, flash, image, video) now runs `engine-preflight.sh` first: it waits up to 60 s and
+refuses the start while what is left of an engine holds GPU memory, while the driver holds
+memory no process accounts for (past 16 GiB), or while `nvidia-smi` does not answer; systemd
+tries again every 15 s and the lane starts by itself once the memory is back. Nothing else
+blocks a start, another program's GPU memory included. Tested on the reference box with a fake
+engine remnant holding 16 GiB: two refusals, then a start 7 s after the memory was released.
+The cockpit says why: "waiting for GPU memory" with the reason, "not starting: GPU memory
+held", never "starting" or "keeps crashing". A new guard never restarts a running engine
+(`engine-inputs.py` leaves it out of what the engine reads).
+
+**A request that reaches the proxy while its engine comes back waits for it (proxy v6.28).**
+Measured with the real clients against fake engines: on a 503 with `Retry-After: 30`, opencode
+1.18.32 failed the session after 6 attempts and 151 s, Claude Code 2.1.286 after 11 attempts
+and 325 s, so every engine restart (7.5 min on the 27B, 11 on flash) ended every session it
+caught. A request that finds the engine not answering while `qwen38-sglang` or `qwen38-flash`
+is starting, between two attempts, up, or in the stop half of a restart is now held, at most
+1200 s (`PROXY_HOLD_UNITS`,
+`PROXY_HOLD_MAX_S`, set in the proxy's unit): a streamed one gets its 200 and the keepalives
+at once, which both clients waited on for 400 s and then took the answer; a non-streamed one
+waits in silence. One that still fails after the wait ends its stream with an error event,
+which both clients answer by sending it again (measured). The request in flight when an engine
+dies still gets the engine's own answer: a 500 before any token, which opencode retries after
+2 s and Claude Code after 0.5 s, or a stream cut short, which the proxy now passes on as a cut
+(no closing chunk), and both clients send again at once as a stream: that retry is the one held.
+On the Anthropic dialect the proxy used to end a cut stream with an error event, and Claude Code
+answered it with a request without a stream, held in silence, which it gave up on after about
+330 s, three times over one restart, before it ended with no answer (found by the end-to-end
+test below). Not held: a lane stopped on
+purpose, the image and video lanes, `GET` routes, a proxy run by hand, and an engine that
+answers and still fails the request (once a hold began, a boot not quite done gets it again
+10 times at most, each after a pause: found in review, the first version sent it back in a
+loop with no pause). The suite runs every case against a proxy process and in-process, where
+the coverage floor sees it; the floor moves from 83 to 85 % (87 % measured).
+
+**A server alive without its scheduler is restarted.** SGLang v0.5.19 can be left with its
+server process alive and no scheduler: a SIGQUIT that reaches the server while the scheduler
+runs raises its exit inside an asyncio task, which swallows it (reproduced). Nothing answered,
+the unit stayed active, and nothing restarted it; the cockpit read it "degraded" for as long
+as it lasted. The cockpit now restarts that one case, after 2 min, at most once per half hour
+per lane, through the start guard; `COCKPIT_ZOMBIE_RESTART=0` leaves it to the operator. The
+general autoheal stays off.
+
+**Tested end to end on the reference box** (the flash lane serving, the real opencode and
+Claude Code streaming long answers, its server sent SIGQUIT, twice): the runs found four
+faults the unit tests could not, fixed here. The cockpit's zombie probe asked `docker top`
+for a column list it refuses, so it never saw a zombie; a cockpit that had watched the boot
+read the zombie as "capturing graphs", which no restart follows; a restart's stop half ended
+the waits; and the error event on a cut stream left Claude Code without an answer. With
+them fixed, opencode's request was held 632 s in one run and 1,066 s in the other and got
+its whole answer both times, and Claude Code's was held 1,068 s and got its whole answer.
+The account is in docs/engine-restarts.md.
+
+**One crash of a serving lane no longer reads "keeps crashing, it dies during startup"**: the
+15 s systemd waits between two attempts look the same after a crash while serving and after a
+boot that dies, and the cockpit now tells them apart (seen on the reference box). The warning
+before a restart from the cockpit says requests wait for the lane now; before a stop it still
+says clients get errors.
+
+**The NVRM line the issue reads as the restart race is routine**: `NV_ERR_NO_MEMORY ...
+mem_desc.c:1359` appears 4,286 times in three weeks of the reference box's journal, two thirds
+during ordinary engine boots, the rest when another GPU client creates a context while an
+engine holds the pool. Every public report of the crash itself that we found runs driver
+580.159.03 (sglang#40948, vllm#52877, issue #26); 580.173.02 lists GB10 fixes that match its
+chain, which is the version boundary we see, not a proof. Update a driver through the DGX
+Dashboard's OTA: an `apt upgrade` alone has left GPUs unusable (driver and GSP firmware not
+paired).
+
+**The daily pin watch no longer files an issue on an endpoint having a bad minute**
+([issue #33](https://github.com/hasso5703/dgx-spark-qwen38/issues/33)). Its run of
+2026-10-01 13:08 got 504s from the GitHub API for the two SGLang source commits and the
+opencode release, and called the release "no such release or asset, or no answer"; every pin
+resolved when checked again, the opencode asset with its pinned digest. `check-pins.sh` now
+tells a dead pin (an answer that says gone: a 404, a digest that changed) from one it could not
+ask about (no answer, a 5xx, GitHub's rate limit, no registry token), says which on each line,
+and when that is all it saw, ends with "N of M pins could not be asked about ... run it again";
+both still exit 1. The watch asks a second time, ten minutes later, before it files an issue.
+
+An update restarts the proxy once (v6.28) and the serving engine once, its unit having
+changed; from then on every engine start goes through the guard.
+
+## v1.20.5 (2026-10-01): the collapsed rail's button stays in its box
+
+With the rail collapsed, its footer is a box one icon wide, and the button in it still wrote
+the word "Expand", which ran past the box and the rail's edge, off centre (seen on the
+reference box). Collapsed, the button now shows its chevron alone, centred in the box; the
+word stays for screen readers, and the button's title says it to a mouse. The touch check
+measures it in a real Chromium: everything visible in the footer stays inside its box, the
+button's content is centred, and it has its title; those three checks fail on v1.20.4.
+
+## v1.20.4 (2026-10-01): the cockpit counts a queued request once, and keeps it in flight while it waits
+
+Eight long prompts sent at once on the reference box (856,000 tokens for a 474,816-token
+pool, the queue chosen in v1.20.3) were all answered with the right content, the last after
+22 minutes, with no retraction, and the cockpit misread the wait twice. Its Traffic view read
+"5 Running, 3 Waiting" while the engine ran two and queued three: the engine's load counts a
+queued request in `num_reqs` too (running plus waiting, the `/get_load` shape the cockpit
+projects from `/v1/loads`), and the page wrote that sum under "Running"; the Now view's
+sentence, the serving lane's line and the Requests card said the same. They now show what
+runs (`num_reqs` minus `num_waiting_reqs`) and name the queue beside it ("2 running, 3
+waiting"). A request in its chunked prefill is in neither of the engine's two counters, so
+they can add up to one less than the proxy's in-flight count. And the Requests table turned
+the five still waiting into "no end logged" once ten minutes of newer traffic had passed
+since they started: that rule dates from before the proxy wrote one end line per request
+(30/08), and a generation has no deadline. A request now stays "in flight" until its end line
+or until the journal says the proxy that took it is gone (systemd's stop or crash line, or the
+next proxy's banner), and only then reads "no end logged", with that reason under it. Tests
+hold both, and fail on v1.20.3.
+
+## v1.20.3 (2026-10-01): the flash lane's opencode window is 205,000 tokens at eight requests too
+
+On its default tier, eight requests at once, the flash lane gave opencode 100,000 tokens of
+context and 16,000 of output, so that eight sessions at their largest would always fit the KV
+pool together. Measured live on the reference box with eight opencode subagents: they held 60
+to 68 % of the 474,816-token pool at that window, nothing waited, and a documentation agent
+compacted at 88,520 tokens (opencode compacts at `limit.input` minus the smaller of 20,000
+and `limit.output`: 84,000 there). The concurrency tier now gives opencode the context
+tier's pair, 205,000 and 32,000: one request fits exactly as it does on `context` (the same
+threshold, worst step and answer under the same 250,000 ceiling and 262,144 window), and when
+eight sessions outgrow the pool together the engine queues the newcomers and retracts as it
+must, which costs time and fails nothing. The reference box's operator chose that: a queue
+rather than a 100K window. An update writes the new pair into opencode's config and restarts
+opencode-web once so it reads them. The installer's line on when compaction fires now uses
+that same rule; it said 80,000 where opencode compacted at 84,000.
+
+## v1.20.2 (2026-10-01): a box updated by the one-liner knows which release it runs
+
+The cockpit told a box it was behind for the release it ran: "Version v1.20.1 is out; this
+box runs v1.19.0", on the reference box running v1.20.1. Its release check named the
+installed release from the checkout's git tags (`git describe`), and the one-liner fetched
+main and no tag, so every box it updated kept describing itself as the release it was first
+cloned at; the Library view's release line said the same. The check now reads the release
+the checkout's own CHANGELOG.md names, the one the cockpit's badge already showed, and
+`get.sh` fetches the release tags too, so `git describe` agrees with it (a tag of the same
+name made on the box is kept, and the update goes on). Tests hold both: the check against a
+checkout whose tags lag its files, and `get.sh` against a release tagged after the clone and
+a local tag of the same name; they fail on v1.20.1.
+
+## v1.20.1 (2026-10-01): the cockpit names the release it runs, after an update too
+
+The cockpit reads the release it names, the first heading of CHANGELOG.md, when it starts,
+and an update restarted it only when its Python or its unit changed. v1.20.0 changed
+neither (the page's scripts and the notes), so a box updated to v1.20.0 kept a cockpit that
+said v1.19.0, in its badge, its Server header and the User-Agent of its release check, until
+something else restarted it (seen on the reference box, 2026-10-01). `install-dashboard.sh`
+now counts CHANGELOG.md among what the cockpit read at start: an update that brings a new
+release restarts it once, and a run that brings nothing still restarts nothing. The page's
+own files were never the problem: they are served with `no-cache`, so an open page takes
+them at its next load. A test runs the guard as written; it fails on v1.20.0.
+
+## v1.20.0 (2026-10-01): every lane on every box, by default
+
+**The one-liner installs everything.** A plain install, first install or update, puts every
+lane on the box: both text lanes (the one `MODEL_CHOICE` names serves, the 27B by default,
+and the other one is installed beside it, ready to load from the cockpit), the image lane and
+the video lane, with the typed-decision endpoint the proxy already carried. Each lane a run
+installs for the first time proves it serves before the run ends. All of it is about 440 GB
+of disk and a little over an hour of work on a new box, plus the downloads (about 75
+minutes at 100 MB/s). A lane that does not fit
+on the disk is left out and named at the end, with the command that adds it later, and the
+rest installs.
+
+**Updating a box from before v1.20 installs what it does not have yet**: up to about 390 GB
+of downloads for a box that had the 27B lane alone. To keep a box as it is, pass the flags
+below once; later runs remember them.
+
+### How a run lays it out
+
+**The other text lane is this same installer, started again for that lane**
+(`QWEN38_SECONDARY`). That run converges on its own lane's unit, so the target, the revision,
+the context mode or the tier that lane was installed with are kept across updates (the
+abliterated 27B beside a serving flash stays abliterated, at 1M); it installs its unit without
+enabling it at boot and starts nothing, and it leaves the proxy, the boot lane, opencode, the
+cockpit and the side lanes to the run that started it. The parent passes it what both lanes
+share (the port, the HF cache, the binds) and nothing of its own lane's: a `MODEL_CHOICE` or a
+`MODEL_REV` given for the served lane must not pick the other one's. It runs before step 7,
+so opencode lists both lanes from the first run on.
+
+**The image and the video lanes are prepared while the served lane keeps serving**, then
+**the proofs come last, and together**, because each needs the GPU to itself: the served lane
+stops once, each new lane boots, answers and stops (the other text lane with the wait and the
+real generation of step 9, now `prove_text_lane`; the image lane with one image; the video
+lane with one 4 s video), and the served lane comes back and proves itself again before the
+proxy and opencode's 1M limits follow its new pool. A proof that fails is said, and the
+served lane still comes back; one that cannot come back ends the run with the command that
+starts it.
+
+**A routine update proves nothing twice**: it updates the lanes it finds and keeps the served
+lane serving. `--with-<lane>` proves a lane already there.
+
+**Leaving a lane out**: `--no-flash` (on a 27B box), `--no-27b` (on a flash box),
+`--no-image`, `--no-video`, remembered in a marker file the way `--no-cockpit` is, and undone
+by `--with-<lane>`. A lane left out stays where it is if it was already installed, and is no
+longer updated. Until v1.20 `--no-image` and `--no-video` skipped their lane for one run only.
+
+**The cockpit**: a lane that is not on the box says `./install.sh --with-<lane>`, which
+installs it beside the serving lane, and offers no checkpoint to pick (it comes with its
+default one; the others download when they are loaded). The image installer's closing line
+names the Load button the way the video installer's does.
+
+**`install-video.sh` counted its checkpoint as 145 GiB** against the 134.2 the lane takes
+(144.1 GB): a box with all of it cached was told "10 GB to download", and a box with 150 GiB
+free was refused for 6 it did not need.
+
+Measured on the reference box on 2026-10-01, with its own install moved aside and put back
+after, and every checkpoint, image and pip wheel already in its caches, so downloads are left
+out: from nothing, the one-liner had the 27B lane up and verified, with the cockpit and the
+Agent view, in 7 min 51 s; prepared the three other lanes in 4 min 24 s; and proved them in
+44 min 23 s: the flash lane answered after 11 min 4 s of boot, the image lane after 80 s, the
+video lane after 12 min 10 s and then made its 4 s video, and the 27B came back in 6 min 56 s.
+56 min 38 s in all. The run after it took 45 s, proved nothing, changed no file and restarted
+no service, and the phone check passed 236 of 236. A v1.19.0 box with the 27B lane alone,
+updated with the one-liner, kept the 27B serving while it brought the three other lanes in,
+proved them (11 min 4 s, 80 s, 11 min 30 s and a video), and had the 27B back in 7 min 4 s:
+49 min 17 s in all, and the same 44-second run after it that changed nothing.
+
+Tests: `tests/test_install_every_lane.py` runs each piece as written, against stubs and a
+copy of the script that ends before step 1: the markers, the flags, the other lane's run
+converging on the reference box's own layout, the parent's hand-off, the order of the proofs
+and what each failure costs, and the proof of a text lane. 19 deliberate mutations of the new
+code, 19 caught. The 15 tests that pinned the opt-in lanes now pin the defaults.
+
+## v1.19.0 (2026-10-01): a first install works again, MiniMax-H3 as a fourth lane, and a cockpit rebuilt and checked under a finger
+
+**A first install works again.** v1.18.7 stopped every install on a box that had never had
+this repo at step 7, the opencode step, with `Install failed at line 1411`; an update of a
+complete install got through. The same one-liner finishes a box that v1.18.7 left there.
+Then three things arrive together. **MiniMax-H3 is a fourth lane**, opt-in with `--with-video`:
+text to video with its sound made in the same pass, and first/last-frame conditioning,
+served from the SGLang cookbook's recipe with no local patch and driven from the cockpit
+like the other three. **The cockpit is rebuilt** around one pool of unified memory and the
+four lanes that take turns in it, with a lane change as one journey, and it is now checked
+under a finger: a browser test in CI taps where a finger lands on five touch screens,
+because the first phone that tried the rebuilt page could not change view at all. **The
+flash lane serves eight requests** by default, on the nightly engine the reference box
+validated. Proxy v6.26 and v6.27 close the guard findings the v1.18.7 review left open.
+A box that updates keeps its lanes, its flash tier and its choices; what an update restarts
+is only what changed.
+
+### A box that never had this repo installs again
+
+**Step 7 ended every first install of v1.18.7.** The step fingerprints the two configs
+opencode-web reads, so that the server restarts only when one of them changed:
+`OC_SUM_BEFORE="$(oc_configs_sum)"`, whose body ran `cat` on both files. On a box with
+nothing installed neither exists yet, `cat` failed, `pipefail` failed the pipeline, the
+assignment took its status and `set -e` ended the run: `Install failed at line 1411
+(command: OC_SUM_BEFORE="$(oc_configs_sum)")`, after the image, the checkpoints and the key
+were in place and before anything was installed. An update of an install older than v1.18.7
+had both files and got through, which is why the reference box, updated at every release,
+never met it. It was found by running the one-liner there with the whole install moved
+aside, on 2026-09-30. A missing file is now part of the fingerprint, in `install.sh` and in
+`switch-model.sh`, which carried the same two lines. The suite had never run an install
+past step 1 (each of its runs stops at a wall before the part that acts on the machine), so
+a test now runs these lines under the scripts' own shell options from an empty HOME; it
+fails on v1.18.7.
+
+**The run after a first install restarted the engine it had just started.** The installer
+writes the unit, then restarts the engine in the same second, and systemd gives the start
+in whole seconds: compared with the file's fraction, the write read as a change made after
+the start, so the second run of the one-liner on a new box cost an 8-minute boot, a new
+pool, refitted opencode limits and a restart of opencode-web, for nothing. The engine's
+check now compares whole seconds on both sides, as the installer already did for the proxy,
+the cockpit and opencode-web.
+
+**A lane the box does not have names the command that installs it.** The cockpit told a
+flash-only box to run `./install.sh` for the 27B lane, which re-runs the lane the box
+serves and never brings the 27B one, and the target picked in a missing lane's card changed
+nothing in the command beside it. A text lane's command now names the target picked:
+`MODEL_CHOICE=stock ./install.sh` by default.
+
+Measured on the reference box on 2026-09-30 and 10-01, its own install moved aside for
+each run and put back after: the one-liner of v1.18.7 stops at step 7 as above, and this
+release, run on what that left, finishes in 7 min 42 s. On a box with nothing, it installs,
+boots and verifies the 27B lane, the proxy, the cockpit and the Agent view in 7 min 35 s
+(pool 917,099 tokens), and the flash lane (`MODEL_CHOICE=flash`) in 11 min 37 s, on the
+concurrency tier with the key on no command line. A v1.18.6 install updated to v1.18.7,
+then to this release, serves after each, and `--with-image` then adds the image lane in
+5 min 05 s, proved by an image before the box goes back to its text lane. The run after
+each first install and after the update took 10 to 11 s, changed no file and restarted no
+service, and the phone check passed 236 of 236 on each of those boxes. The checkpoints and
+images were already in the box's cache, so these times leave the downloads out.
+
+### The cockpit rebuilt, and checked under a finger
+
+**The cockpit, rebuilt.** The page that was one script and a tab selector is a rail of
+eleven views sharing one scope: Now (one pool of unified memory, the four lanes that take
+turns in it, a rack to load one), Lanes, Traffic, Machine, Agent, Decide, Image, Video,
+Library, Logs and Settings. Changing lanes is one journey, switch, stop and start, one job
+per step, each asking first and showing its exact command, stopping at the first gate
+that refuses; in dry run the journey no longer waits 90 s for an engine that never goes
+down, and says up front that a later gate can refuse because the box still reads as it
+was. The Video view reads the lane's real progress from its journal (the lane itself says
+"queued 0 %" for the whole run), and refuses a canvas larger than 864x480 for longer than
+4 s: 720P is measured at 4 s only, at 82 GB, and the time budget alone admitted it up to
+15 s. Every test that read the old script now reads the page the browser loads, and none
+was weakened to get there.
+
+**On a phone, the rail answered no tap.** Found on the reference box's phone: a tap on a
+view closed the drawer and changed nothing. `.shell` carried `z-index: 1`, which made it a
+stacking context, so the drawer inside it (60) stacked as a whole at 1, under the veil its
+own opening draws (55): every tap landed on the veil, whose click closes the drawer. The
+same trap held the Agent's fullscreen frame under the head and over its own exit button,
+on every device, and the view's entry animation, left filling after it ended, kept a
+second stacking context around it. The drawer was also as tall as its items (the desktop
+rule's `align-self: start` sized the fixed drawer to its content), so on a phone on its
+side it never scrolled and its last four items sat below the screen. All three are fixed,
+and the page now keeps what an iPhone reserves (it asks for the whole screen with
+`viewport-fit=cover` and kept none of it): the head, the rail, the page, the dock, the
+toasts, the sheets and the fullscreen frame stay clear of the notch in landscape and of
+the home indicator, with opencode inside the frame held to the safe area. The drawer takes
+the focus to the view you are on and gives it back on Escape; a closed dialog gives it
+back to what opened it.
+
+**The Agent frame, the phone tables, and smaller things that were not true.** Inline, the
+Agent frame was sized on a guess of 150 px above it and left opencode's composer below
+the fold on a phone, a tablet and a laptop: it now fills what is really left under the
+view's buttons, or takes a screen and scrolls under the head when too little is (measured
+62 to 89 % of the screen, the composer on it, on three phones, two tablets and three
+desktop sizes).
+On a phone the request log put each request's outcome three columns past the edge of the
+screen; it is one card per request now, outcome beside the time, and the Library's wide
+tables stack into cards whose lines carry their column's name. Long facts were cut with no
+way to read them under a finger; they wrap. Every dense table's first cell sat 12 px right
+of its header (a padding shorthand of the same specificity as the rule it undid), the
+proxy's state pill stretched across its row, empty tags drew empty pills, and the rack and
+the Lanes view called the last recorded boot's KV pool "this boot" beside the live one
+(400,384 against 491,136 on the reference box): the serving lane shows what its engine
+reports now.
+
+**A cockpit restart logged a warm-up, and a silent engine read as a boot.** Every restart
+of the cockpit logged "warming-up -> ready" for the serving lane two seconds later (five
+in the event log of 2026-09-29/30): the sampler tiers started together, and the lifecycle's
+first pass read "no health sample yet" as "unhealthy". The health tier now starts first and
+the others once it has sampled, without holding the HTTP server. The same line hid a worse
+case: an engine that really was not answering when the cockpit came up read "warming up"
+for as long as it lasted, a boot state, which holds every switch back. Past the lane's
+usual boot plus five minutes it now reads "degraded", unless this cockpit watched the
+boot.
+
+**Two answers that pointed the wrong way.** The request log painted the Decide view's
+availability probe a red failure once a minute while the view was open: it is a body with
+no state, refused at the schema by design so no model runs, and it now reads as the
+cockpit's own probe, in no alarm colour. And a video call made while the lane ran its three
+warm-up requests waited a minute and was told to start the lane, which was running: it is
+told the lane is warming up or busy. The cockpit's answers when the image or the video
+lane is down still sent people to the switcher and the action bar the rebuild removed; they
+name the Load button of the Lanes view. And the Video view read "Reading the prompt" again
+for the last seconds of every run, once the decode was done: a request never goes back a
+phase now.
+
+**The video lane's boot bar went back to starting halfway through its warm-up.** The cockpit
+reads the last 300 lines of the lane's run, and its own `/health` probe writes one every 2 s
+through the ten-minute warm-up, so the boot's markers left the window before it ended and
+the lane read "starting" again (found on the reference box on 2026-09-30, FastAPI's start at
+line 74 of 395). As on the text lanes, a boot no longer goes back within one activation, and
+a cockpit that came up after the markers left reads the run's first lines, once.
+
+**The engines' coordination ports, written down.** Each engine process opens PyTorch's
+distributed store on every interface, whatever its API's bind, and torch has no setting to
+narrow it: on the reference box the flash scheduler answers on `*:45385` from the LAN and
+the tailnet, the video lane on `*:30005` with four gloo ports. It takes no key and serves no
+data, but a hostile connection can disturb the engine. `SECURITY.md` says so, shows how to
+see them and how to firewall a box on a network you do not control, and the video lane's
+doc no longer calls its loopback bind the only thing in front of it. Taking these ports off
+the network by default is on the roadmap, to be measured first.
+
+**The video lane's validation of 2026-09-29, in its doc.** 4 s at 480P took 759.6 s (592 s
+four days earlier: the DiT was read back from the NVMe at every step, the drive at 76 °C),
+15 s at 480P took 2,830 s at a peak of 78.3 GB, an idle lane holds 1.04 cores, and a second
+request sent straight to the lane queues behind the first; the largest call the cockpit
+admits still ends inside its two-hour lock at the hot rate.
+
+**Held by a browser that taps.** Every browser check switched views with `click()` from
+script, which ignores what covers the element, so all of them stayed green over the phone
+drawer. `touch-check.mjs`, new and in CI, drives a cockpit of its own with real touch
+events on five touch screens and a laptop, reads what the page did, audits every control
+of every view for anything covering it, and checks the safe areas: 244 checks, 128 of them
+failing on the previous revision. `mobile-check.mjs`, the manual check against a live box,
+taps too and checks both Agent modes.
+
+### An update touches only what changed
+
+**The first update after a switch restarted opencode-web for a name.** A flash install
+named the 27B entry of opencode's config generically, whatever its unit served, and the next
+switch back renamed it after its target: so the first update after every switch rewrote the
+config and restarted opencode-web, cutting whatever the Agent view was doing (seen on the
+reference box, an update that changed nothing else). The lane that is not being installed now
+keeps the name of the checkpoint its unit serves, from the same table as the served one.
+
+**Said as it is.** The installer printed "wrote launch-flash.sh" on runs that changed
+nothing, and the installers' closing lines still pointed at the switcher the rebuild
+removed; they say unchanged, and name the Load button of the Lanes view.
+
+Measured on the reference box on 2026-09-30, updating while the video lane served: the first
+run rewrote the flash launcher (the key moved off the engine's command line to its secrets
+file, which the flash lane's next start confirmed: no process carries it) and, before the
+fix above, renamed the 27B entry; the run with the fix put the name back, and the run after
+it changed no file and restarted no service.
+
+### The flash lane defaults to the concurrency tier, the engine to the nightly
+
+The 2026-09-29 campaign on the reference box (bench, canaries, needle, prefix
+cache) validated `--mamba-max-states-per-path 2` and the nightly engine
+`cb6ed363`, and that box has served both since. This writes what it already
+does back into the plan: `FLASH_TIER` defaults to `concurrency` (8 requests,
+40 slots, 2 states per path), `FLASH_IMAGE` pins
+`lmsysorg/sglang@sha256:cb6ed363...` (the 9d2a843c pin it replaces is untagged
+by the update like any retired pin, so a prune reclaims it), and `uninstall.sh`
+knows both digests. A re-run keeps an installed `context` box on `context`: the
+tier detection now reads the 4-request launcher too, which the old default never
+needed. Without this, the next `./install.sh` silently walked a concurrency box
+back to the 2026-09-07 image at 4 requests and 20 slots.
+
+What a new install changes for opencode: on the default tier its flash limits are the
+concurrency tier's, 100,000 tokens of context and 16,000 of output (116,000 at worst, the
+figures measured on 2026-09-12), where the context tier gives 205,000 and 32,000. They stay
+until eight heavy streams at once are measured on this pool. `FLASH_TIER=context
+./install.sh` keeps one conversation's larger window, and an update keeps whichever tier a
+box already serves.
+
+### The MiniMax-H3 video lane (fourth lane, opt-in)
+
+`./install.sh --with-video` adds text-to-video with joint video-and-audio
+(MiniMax-H3, `MiniMaxAI/MiniMax-H3` at `42ed227e`), driven like the other three lanes:
+Load and Stop in the Lanes view, about 12 min to ready. It serves the SGLang cookbook's MiniMax-H3
+recipe exactly as upstream wrote it at the pinned source commit, with no local patch:
+no placement flags (the cookbook verifies the DGX Spark with none, and the offload flags
+measured 2.1x slower there), `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, loopback
+bind behind the cockpit's Video view. The view holds the asynchronous call (create, poll to
+completed, download) and refuses outside the cookbook's bands (4 to 15 s, one video per
+call, t2v/fl2va on the fl2va weights). The cookbook's Spark figures are quoted as the
+cookbook's until the lane proves itself here. Each addition comes with the tests that
+hold it, checked by running the whole offline suite with and without it.
+
+**Proxy v6.26: the three guard findings the v1.18.7 review left open, closed.** S4: a
+request key spelled with a JSON `\u` escape (`"\u0074op_logprobs"`) carried none of the
+bytes the guards scanned for, so the logprob ceiling and the token-id refusals were skipped
+and the value reached the engine; a body carrying any `\u` is now parsed rather than
+scanned. S5: the sampling and logprob guards now also cover `/v1/responses`, `/invocations`
+and `/vertex_generate` (which nests its fields under `parameters`), read `input_ids` and
+`prompt` as a batch of lists, read `sampling_params` as a list, and the oversize guard now
+reaches `/generate` and the other non-`/v1/` generation routes instead of only the `/v1/`
+prefix. S6: the TLS handshake no longer runs in the accept loop, where one silent client
+parked every other connection behind its timeout; it now runs in the connection's own
+thread on its own budget, and a handshake that dies leaves one journal line instead of a
+traceback the cockpit would render. Each change is held by a test that failed before and
+passes after.
+
+**Proxy v6.27: the review's second pass, verified against the installed engine.** The
+guards judged the raw JSON value, but the engine's pydantic models coerce `999999`,
+`"999999"` and `999999.0` to the same int before the scheduler runs, so a crash shape
+typed as a string sailed through the ceiling and the token-id refusals; the guards now
+judge each value the way the engine reads it, and the vertex route also judges
+`parameters.sampling_params`, which the scheduler spreads into its SamplingParams. The
+video lane bounds `num_inference_steps` server-side (1 to 100, as the image lane
+already does) instead of trusting the page's slider; its stop message no longer
+promises a 5 s cut the unit never makes (it waits up to 60 min); its curl preview no
+longer prints a `task` the server refuses; and its lock hand-off now carries the
+timeout with the call that timed out instead of re-reading a global a test could have
+already restored. `install-image.sh` starts the lane that was serving again after its
+smoke test even when that lane was the video or llamacpp one, and `install-video.sh`
+refuses a `VIDEO_BIND=0.0.0.0` that would put a keyless generator on every interface.
+Each change is held by a test that fails on the previous revision and passes here.
+
+**Cockpit display coherence: one definition of in flight, physical pool numbers.**
+Seen live with eight reviewers on the lane: the rail badge said 7 while the Requests
+table said 6, and the pool read 106 % of capacity. Three separate causes, all in the
+display, none in the serving. First, the feed keyed requests by peer, so two turns
+sharing a keep-alive connection collapsed into one row (and the first end line marked
+the second request as done): starts now open their own record and ends close the
+newest still-open one. Second, the badge read the engine's running-plus-waiting while
+the table read the proxy's open rows: the badge now counts the same live rows as the
+header chip and the table. Third, the pool bar compared the requests' summed context
+lengths (shared prefixes counted once per request) against physical slots: bars and
+big numbers now use the physical count the engine reports, with the logical total
+kept as a sharing note, and "Tokens in KV" reads physical too. The feed window grows
+200 to 800 journal lines so a long request's start survives it, and long client
+addresses and paths clip with ellipsis (full strings in the tooltips) instead of
+printing over each other. Each change is held by a test that fails on the previous
+revision and passes here.
+
+**The video lane's second review, in two passes: fifteen defects found, fifteen fixed.**
+Pass one (whole branch): the installer's smoke test POSTed a body without `task` and
+without `target`, which the lane 400s by construction (verified against the installed
+lane's own validator, not just the doc): every `./install.sh --with-video` would have
+booted the lane for fifteen minutes and then died on its own smoke test; the body now
+carries the cockpit's measured shape and a test parses it out of the script.
+`switch-model.sh` verified the checkpoint with `snapshot_download` without a
+`revision`, which resolves `main` over the network and repoints `refs/main` at the
+upstream tip before the first byte of a download lands, the offline unit included; it
+now fetches the sha `refs/main` holds (the installer's pin when the ref is missing,
+`main` only for a custom model), and writes the ref when it is absent or holds no
+commit hash, on the local-cache success too - never moving a valid one. A legal request
+(15 s at 720P on 100 steps, the UI's own caps) estimated about three hours, past the
+two hours the single-flight lock is held, which frees the lock while the lane still
+works and admits a second generation beside the first: the cost is now budgeted at
+admission on the two measured figures (3.05 and 7.65 s per step-second, decodes
+folded in, plus the ~10 % keyframes measured). The lock's watcher treats the lane's
+`missing` as terminal exactly as the synchronous poll does, and the smoke test's death
+paths print the journal their messages point at (`|| true`, or `set -e` silences the
+message itself). The Video view's curl preview printed a body the lane refuses in both
+modes under a label promising "exactly what the button above sends"; it now shows the
+real forwarded body shape quoted with `shq` (the keyframe URIs stay placeholders:
+the cockpit stages random names), and
+the cost line answers 720P with the 720P measurement. `SECURITY.md` line 160 is back
+to two-space continuation. Pass two (re-review of pass one's own fixes): the
+admission budget double-counted its decode and priced any canvas past 720P at the
+720P figure - it now answers the two measured rows exactly (4 s 480P says 10 min,
+measured 9:52 - the 10:52 was a typo for the journal's 592 s) and refuses canvases past 1280x720 and ratios other than 16:9/9:16,
+the image lane's pixel-ceiling rule; the view carried a *different* formula than the
+server (portrait sizes priced 2.6x apart), now the same numbers with a parity test
+that answers accept/refuse through both; a call refused 409 for a busy lane left its
+two staged keyframe PNGs on disk forever, retry after retry, now unlinked like the
+finally does; a run needing the hour-plus-the-watcher answered 504 and the view threw
+the video id away, now it parks the id and shows the content URL that serves the MP4
+when the lane is done; the smoke's t2va body would have been run against ref2va or a
+custom model on a fifteen-minute boot, now skipped with a reason; a video lane's
+`HF_HOME` was missing from uninstall's cache inventory (145 GB unlisted, and the CI
+gate structurally blind to it); and three claims in the docs and the bench table (a
+refusal the view does not make, a measured row called cookbook, a staging claim naming
+paths the cockpit does not use) are now true. Fifteen tests added or rewritten;
+the dashboard suite then counted 682, all green.
+
+Pass three (concurrency and cost review of the branch itself, 2026-09-28, each finding
+verified against the runtime before it was believed): a `systemctl` slower than its
+five seconds read as the lane dying - the silence is now "do not know", not a cut, a
+false "the lane was stopped" and a lock given back beside a lane that was only mute
+(both lanes); the admission guard had no slack at all, and the largest accepted
+estimate landed the lock's deadline on the lane's expected finish, so refusal now
+carries a tenth (server and view, a parity test holds it); the video route rode the
+image lane's 40 MiB through a shared `max()` where a prompt and two keyframes want
+its own 10 MiB, now refused over-cap by a test at the socket; a seed of `abc` reached
+the wire as `seed:null` and the filter dropped it in silence - the view now says a
+seed is a whole number or empty; the keyframes were staged outside the error paths (a
+full disk answered nothing and left the half-written PNG), the 504 hand-off unlinked
+files the queued job had not read yet (the lane localizes `file://` URIs when the job
+starts, not when the POST arrives), a cockpit killed mid-call left them forever, and
+the parked video's link died on an F5 - each now has its path, and the link rebuilds
+from `/api/video`; the switch's video branch still had no room check where the text
+branch had learned one (145 GB behind a button on a box with 90 free, the offline
+unit included), and the rollback guard now really disables the competing units at a
+switch, llama.cpp's included; and where the template comment and the docs promised a
+stop that waits out the generation, the journal shows all seven stops cancelling the
+task and finishing under a second, the numbers are the journal's: 592 s at the
+50-step default, 11.1 s per step. Seventeen tests added or rewritten: thirteen new
+(ten dashboard, three switch) and four pins rewritten, all green, `ci-local` 45 ok.
+
 ## v1.18.7 (2026-09-24): a full review of v1.18.6, and the defects it found fixed with a test each
 
 A line-by-line review of the whole repo at v1.18.6 (code, templates, tests, CI and docs)

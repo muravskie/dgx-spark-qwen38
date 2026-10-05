@@ -1,13 +1,15 @@
 # The image lane: Qwen-Image 2.1 on one Spark
 
 Text to image, image editing and native RGBA, served by SGLang Diffusion in its own
-venv, on its own port, driven from the cockpit's **Image** tab. Opt-in, because it costs
-38 GB and about 25 minutes:
+venv, on its own port, driven from the cockpit's **Image** view. Every plain install
+includes it since v1.20 (40 GB: 31 checkpoint, 9 runtime), and proves it with one image the
+first time. `--no-image` leaves it out, and later runs remember that; `--with-image` brings
+it back:
 
 ```bash
 ./install.sh --with-image
-# or, from nothing at all:
-curl -fsSL https://raw.githubusercontent.com/hasso5703/dgx-spark-qwen38/main/get.sh | bash -s -- --with-image
+# or, from nothing at all, with every other lane:
+curl -fsSL https://raw.githubusercontent.com/hasso5703/dgx-spark-qwen38/main/get.sh | bash
 ```
 
 Once installed, a plain `./install.sh` keeps it and updates it. `./install-image.sh`
@@ -21,17 +23,15 @@ that disk and on the one the runtime goes to (`IMAGE_LANE_DIR`).
 ## A third lane, switched to like the other two
 
 Once installed, the image lane is driven exactly like the 27B and flash lanes, from the
-same three controls at the top of the cockpit, and it obeys the same rule.
+same single Load control, and it obeys the same rule.
 
-1. **Pick `Qwen-Image 2.1`** in the switcher (it sits under its own *Images* heading)
-   and press **Switch**. `switch-model.sh image` verifies the checkpoint and makes the
-   image lane the one unit enabled at boot. Like every switch, it never starts or
+1. **Load it.** On the cockpit's Lanes view pick `Qwen-Image 2.1` and press **Load**: one
+   journey that switches the boot, stops the serving lane and starts the image lane,
+   each step its own job, asking first and showing the exact command. Like every
+   switch, `switch-model.sh image` itself verifies the checkpoint and never starts or
    stops an engine.
-2. **Stop** the lane that is serving. The action bar's lane button reads `Stop 27B`
-   while the 27B serves.
-3. **Start Qwen-Image**. It answers in about 70 seconds; the lane pill, the Engines card
-   and the Image tab all show which component it is loading, in the engine's own words
-   ("the 16.5 GB Qwen3-VL encoder", "the 13.3 GB DiT"), and Generate turns on by itself.
+2. It answers in about 70 seconds; the lane pill, the Lanes view and the Image view
+   all follow the boot in the engine's own words, and Generate turns on by itself.
 
 Back to text is the same three moves the other way. From a terminal the switch is
 `./switch-model.sh image` (or `stock`), and it prints the two commands that follow.
@@ -47,12 +47,12 @@ The unit also carries `Conflicts=` with every text unit, as a second belt for a
 `systemctl start` typed at a terminal, which the cockpit's gate never sees. Through the
 cockpit it is never reached, because the start is refused first.
 
-The Image tab has no start or stop of its own. The first version had one, and it started
+The Image view has no start or stop of its own. The first version had one, and it started
 this lane by a path none of the others use, stopping the text lane silently through
-`Conflicts=` where every other lane is refused with "stop it first". The tab now says
+`Conflicts=` where every other lane is refused with "stop it first". The view now says
 which of the three moves is next, naming the buttons as they read on screen.
 
-The Engines tab's Flush cache, Abort all and Smoke are greyed out while the image lane
+The engine actions menu's Flush cache, Abort all and Smoke are greyed out while the image lane
 serves: they talk to the text engine on :30000, which is closed then. They used to test
 "is an engine ready", which the image lane is.
 
@@ -215,7 +215,7 @@ and `systemctl restart` was the only way back. Two browser tabs are enough to do
 
 So the cockpit serializes. A second request while one is running comes back **HTTP 409 in
 under a millisecond** with the reason, rather than queueing and holding one of the
-browser's six connections to that origin. The Image tab also turns its own button off when
+browser's six connections to that origin. The Image view also turns its own button off when
 the lane is busy with somebody else's request, which it can see because the engine names
 its current stage in its log.
 
@@ -228,7 +228,7 @@ and the memory that needs grows with them. Where it ends for a call that size ha
 measured, and on this box running out of unified memory hangs the machine instead of
 failing the request. So the cockpit refuses a call whose images add up to more pixels than
 the largest call measured here: one 2752x1536 image (4.2 megapixels, 44.8 GB at its peak).
-Four 1024x1024 images fit under it, ten 512x512 too; two 2048x2048 do not. The Image tab
+Four 1024x1024 images fit under it, ten 512x512 too; two 2048x2048 do not. The Image view
 says so before sending, and the server refuses the same with the numbers.
 
 **What is not detected.** When the engine wedged that afternoon, its `/health` kept
@@ -236,7 +236,7 @@ answering `200` the whole time, while a generation request timed out and nothing
 its log. The lifecycle derives "ready" from `/health`, so a wedge like that one would read
 as ready. The text lanes have a generation canary for exactly this (health fine, nothing
 generated); this lane does not yet. The one-at-a-time rule removes the one cause that was
-measured. If the Image tab ever waits far past its estimate on a lane that reads ready,
+measured. If the Image view ever waits far past its estimate on a lane that reads ready,
 press **Cancel** (below).
 
 ## Cancelling a generation
@@ -245,13 +245,13 @@ SGLang Diffusion cannot abort a request: its own video API carries "TODO: suppor
 a job", the image API has nothing, and a client that disconnects leaves the GPU working on
 the call to the end. The only way to end a generation early is to restart the lane.
 
-So that is what the Image tab's **Cancel** does. It shows only while a generation runs,
+So that is what the Image view's **Cancel** does. It shows only while a generation runs,
 this page's or another tab's, asks first like every action, and restarts the lane through
-the same action API, gates and sudoers line as the Engines card: the image being made is
-lost, and the lane answers again in about a minute. It starts and stops nothing else; the
-lane's own Start and Stop stay in the action bar. A request cut this way, or by the lane's
-Stop, or by a restart from the Engines card, reads as **cancelled** in the tab rather than
-as a lane that failed to answer.
+the same action API, gates and sudoers line as the lane's card in the Lanes view: the image
+being made is lost, and the lane answers again in about a minute. It starts and stops
+nothing else; the lane's own Load and Stop stay on that card. A request cut this way, or by
+the lane's Stop, or by a restart from its card, reads as **cancelled** in the view rather
+than as a lane that failed to answer.
 
 ## Three refusals worth knowing before a client hits them
 
@@ -322,11 +322,11 @@ measured rather than inferred: a first pass using standard deviation as the inst
 missed it entirely on a bright reference (73.5 to 78.3, which reads as noise) and the
 zoom did not. Expect a re-rendered image, not a retouched one.
 
-## The cockpit tab
+## The cockpit view
 
 Every parameter the model has, at the model's own defaults, read out of
 `configs/sample/qwenimage21.py` rather than chosen: 1024x1024, 40 steps, one image, CFG
-off, RNG on the CPU. **Reset settings** puts all of them back.
+off, RNG on the CPU. **Reset** puts all of them back.
 
 Prompts to try are prefilled (text rendering, transparent cutout, transparent sticker,
 local edit, combining two pictures), references can be uploaded or generated on the spot
@@ -340,5 +340,5 @@ dump target or a diffusers kwargs blob just because the protocol has a field for
 
 ## Licence
 
-Qwen Research License: research and evaluation, **not commercial use**. It is on the tab
+Qwen Research License: research and evaluation, **not commercial use**. It is on the view
 where the people using the box will read it.

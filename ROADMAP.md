@@ -5,12 +5,34 @@ so that "on the roadmap" means a checkbox with a definition of done, not a
 mood. Statuses: shipped, in progress, planned, considered (considered items
 have a reason they are not yet planned, stated here or in an issue).
 
-## Shipped, current: v1.18
+## Shipped, current: v1.20
+
+- **Every lane by default** (v1.20.0): the one-liner installs both text lanes (the 27B
+  serves, Flash-Next 176B beside it), the image lane and the video lane, each proved
+  the first time; `--no-<lane>` leaves one out, remembered like `--no-cockpit`.
+
+## Shipped, v1.19
+
+- **A first install works again** (v1.19.0): v1.18.7 ended every install on a box that
+  never had this repo at step 7. Found by installing the reference box from nothing, its
+  own install moved aside, and checked the same way with the update from v1.18.7.
+- **MiniMax-H3, a fourth lane** (v1.19.0, opt-in with `--with-video`): text to video
+  with sound made in the same pass, and first/last-frame conditioning, served from the
+  SGLang cookbook's recipe with no local patch, driven like the other three lanes
+  from the cockpit's Video view.
+- **The cockpit rebuilt** (v1.19.0): one pool, four lanes, and a lane change as one
+  journey (switch, stop, start), now checked under a finger on five touch screens by
+  a browser test that taps where a finger lands.
+- **The flash lane at eight requests** (v1.19.0): the concurrency tier with two mamba
+  states per path and the nightly engine the reference box validated on 2026-09-29
+  are the default.
+
+## Shipped, v1.18
 
 Since v1.14 the stack gained a third lane and closed its engine port:
 
 - **Typed decisions** (v1.15.0): `POST /v1/systemone`, the wire contract of
-  TypeSafe's Jev answered by the lane on this box, with a cockpit tab of its
+  TypeSafe's Jev answered by the lane on this box, with a cockpit view of its
   own and its measured comparison in BENCHMARKS.md.
 - **The release check** (v1.15.3), on by default: the cockpit says when a
   newer release is out, and `COCKPIT_UPDATE_CHECK=0` turns it off.
@@ -105,6 +127,12 @@ the cockpit drift panel says so, per lane, until it is.
 - **Per-client limits on the identity layer**: the v6.16 key map names who;
   the honest next step is per-label ceilings and a journal-derived quota,
   designed as an issue with measured motivation, not bolted on.
+- **The engines' coordination ports off the network**: each engine's PyTorch store
+  listens on every interface whatever its API's bind (SECURITY.md, measured
+  2026-09-30). Done means the docker lanes on a bridge network with only their API
+  published on loopback, the native lanes in a namespace of their own or behind a
+  rule the installer owns, and a bench showing the serving path unchanged on every
+  lane before it becomes the default.
 - **A cockpit panel that reads the Prometheus endpoint** now that it exists
   on every text lane: the panel's own canary stays the source of truth for
   "is this lane alive", the metrics join as history, not as a second

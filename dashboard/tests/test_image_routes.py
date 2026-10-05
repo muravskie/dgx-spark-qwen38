@@ -463,7 +463,7 @@ class ThePixelBudget(Base):
             self.assertEqual(code, 400, (bad, out))
 
     def test_the_page_and_the_server_hold_the_same_number(self):
-        js = (REPO / "dashboard" / "static" / "app.js").read_text()
+        js = (REPO / "dashboard" / "static" / "js" / "image.js").read_text()
         self.assertEqual(self.ck.IMAGE_MAX_PIXELS, 2752 * 1536)
         self.assertIn("const IMG_MAX_PIXELS = 2752 * 1536;", js)
         problem = js[js.index("function imgProblem(){"):js.index("function imgEstimate(")]
@@ -788,9 +788,13 @@ class TheCapOnTheseTwoRoutes(Base):
         self.assertGreater(self.ck.IMAGE_MAX_POST, 10 * 1024 * 1024)
 
     def test_the_raised_cap_applies_to_the_image_routes_and_nothing_else(self):
+        # each raised route carries its OWN cap: the video lane's 10 MiB of
+        # prompt-plus-two-keyframes is not the image lane's 40 MiB of ten
+        # references (found in review, 2026-09-28: a max() had made 40 the video's)
         text = (DASH / "cockpit.py").read_text()
-        self.assertIn('cap = IMAGE_MAX_POST if raised else ', text)
+        self.assertIn('cap = IMAGE_MAX_POST if raised else VIDEO_MAX_POST if video', text)
         self.assertIn('raised = path in ("/api/image/edit", "/api/image/generate")', text)
+        self.assertIn('video = path == "/api/video/generate"', text)
 
     def test_the_raised_cap_authenticates_before_it_buffers(self):
         """Otherwise an unauthenticated client makes this process hold 40 MB in a thread
@@ -813,7 +817,7 @@ class WhenTheLaneIsNotThere(Base):
         self.ck.urllib.request.urlopen = refuse
         code, out = self.call({"prompt": "x"})
         self.assertEqual(code, 502)
-        self.assertIn("Switch to Qwen-Image 2.1", out["error"])
+        self.assertIn("Load Qwen-Image 2.1", out["error"])
 
     def test_an_engine_refusal_is_relayed_with_its_own_status(self):
         def refuse(req, timeout=None):

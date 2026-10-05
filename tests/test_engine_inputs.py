@@ -100,6 +100,24 @@ class WhatTheEngineReads(unittest.TestCase):
         self.assertIn(DIGEST, out.stdout.splitlines()[1])
         self.assertIn("qwen38-sglang", out.stdout.splitlines()[2])
 
+    def test_the_guard_the_unit_runs_first_is_no_input(self):
+        """Every engine unit runs engine-preflight.sh before it starts the engine, which never
+        reads it: a new guard, or one rewritten after the start, must not restart a healthy
+        engine. Both lookups found it, the scripts the unit runs and the config files it names."""
+        for flash in (False, True):
+            with self.subTest(flash=flash):
+                box = Box(flash=flash)
+                guard = box.cfg / "engine-preflight.sh"
+                guard.write_text("#!/usr/bin/env bash\necho guard one\n")
+                box.unit.write_text(box.unit.read_text().replace(
+                    "[Service]\n", f"[Service]\nExecStartPre=/bin/bash {guard} {box.unit.name}\n"))
+                fp = box.run("fingerprint")
+                guard.write_text("#!/usr/bin/env bash\necho guard two\n")
+                self.assertEqual(box.run("fingerprint"), fp)
+                later = time.time() + 600
+                os.utime(guard, (later, later))
+                self.assertTrue(box.run("running").startswith("yes"), box.run("running"))
+
     def test_the_flash_unit_brings_in_its_launcher_and_what_it_names(self):
         box = Box(flash=True)
         fp = box.run("fingerprint")
@@ -187,6 +205,28 @@ class TheRunningVerdict(unittest.TestCase):
         box.started = int(time.time()) - 100
         self.assertRegex(box.run("running"), r"^no: .* changed after qwen38-sglang.service started$")
 
+    def test_a_file_written_in_the_second_the_engine_started_is_in_it(self):
+        # The installer writes the unit, then restarts the engine in the same second, and
+        # systemd gives the start in whole seconds: compared with the file's fraction, the
+        # run after every first install restarted an engine that had everything (the
+        # reference box, 2026-09-30).
+        box = Box()
+        t = int(time.time()) - 100
+        for f in (box.unit, box.template, box.cfg / "api-key", box.config_json):
+            os.utime(f, (t + 0.9, t + 0.9))
+        box.started = t
+        self.assertEqual(box.run("running"), "yes")
+
+    def test_a_file_written_the_second_after_the_start_is_not(self):
+        box = Box()
+        t = int(time.time()) - 100
+        for f in (box.unit, box.template, box.cfg / "api-key", box.config_json):
+            os.utime(f, (t, t))
+        os.utime(box.template, (t + 1.1, t + 1.1))
+        box.started = t
+        self.assertRegex(box.run("running"),
+                         r"^no: .*chat-template-sglang\.jinja changed after qwen38-sglang\.service started$")
+
     def test_a_stopped_engine_has_nothing(self):
         box = Box()
         box.active = "inactive"
@@ -251,7 +291,12 @@ class TheInstallerDecides(unittest.TestCase):
         # unit and the flash launcher were compared first (the template, in patch-template.py).
         text = (REPO / "install.sh").read_text()
         self.assertIn('cmp -s "$TMP_UNIT" "/etc/systemd/system/$UNIT_NAME" || sudo install -m 644 "$TMP_UNIT"', text)
-        self.assertIn('cmp -s "$TMP_LAUNCH" "$CONFIG_DIR/launch-flash.sh" || install -m 755 "$TMP_LAUNCH"', text)
+        # the launcher is installed in the branch where the comparison found a difference,
+        # and only there (it also says which of the two happened, since 2026-09-30)
+        self.assertRegex(text, r'if cmp -s "\$TMP_LAUNCH" "\$CONFIG_DIR/launch-flash\.sh"; then\n'
+                               r'\s*echo "launch script unchanged[^\n]*\n\s*else\n'
+                               r'\s*install -m 755 "\$TMP_LAUNCH" "\$CONFIG_DIR/launch-flash\.sh"\n')
+        self.assertEqual(text.count('install -m 755 "$TMP_LAUNCH"'), 1, "no other path writes the launcher")
 
     def test_the_restart_itself_is_the_one_the_decision_guards(self):
         self.assertIn('[ "$ENGINE_KEEP" -eq 1 ] || sudo systemctl restart "$UNIT_NAME"',

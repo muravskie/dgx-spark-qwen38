@@ -7,8 +7,10 @@ Every function here is pure so the whole module is unit-testable offline.
 States (a strict superset of what the UI shows):
   stopped, failed, starting, loading-weights, loading-draft, allocating-kv,
   capturing-graphs, warming-up, ready, degraded, stopping
-Flags: restarting (a crash loop between two attempts). The cockpit adds overdue (a stage
-that took more than twice the ETA).
+Flags: restarting (a crash loop between two attempts); held and refused (engine-preflight.sh
+waits for, or would not start on, GPU memory the last engine has not given back); zombie (a
+server process alive with no scheduler, which nothing restarts). The cockpit adds overdue (a
+stage that took more than twice the ETA).
 """
 from __future__ import annotations
 
@@ -56,9 +58,31 @@ IMAGE_MARKERS = [
     ("fired up and ready to roll", "warming-up", "ready"),
 ]
 
+# ── The video lane speaks the same dialect ────────────────────────────────────
+# MiniMax-H3 is served by the same SGLang Diffusion server from the same source
+# tree, so its boot prints the shared server lines. The component lines below are the
+# ones this pipeline printed on the reference box on 2026-09-25 (boot 23:08:50, DiT
+# 61.73 GB in 13 shards, text encoder 48.09 GB, audio VAE 0.56 GB, video VAE 5.2 GB):
+# a marker for a line never seen is a guess dressed as knowledge, so anything else
+# still falls on the generic "Loading " arm and reads as weights without naming it.
+VIDEO_STAGES = ("init", "loading-weights", "warming-up")
+VIDEO_MARKERS = [
+    # (substring, stage it opens, what is being loaded while that line is the latest)
+    ("Starting server...", "init", "starting the server"),
+    ("Loading ", "loading-weights", "loading a pipeline component"),
+    ("Loading pipeline modules...", "loading-weights", "reading the checkpoint layout"),
+    ("Loading text_encoder from", "loading-weights", "the 48 GB text encoder"),
+    ("Loading MiniMaxH3DiTModel from", "loading-weights", "the 61.7 GB DiT"),
+    ("Loading audio_vae from", "loading-weights", "the audio VAE"),
+    ("Loading video_vae from", "loading-weights", "the 5.2 GB video VAE"),
+    ("Pipeline instantiated", "loading-weights", "building the pipeline"),
+    ("Starting FastAPI server", "warming-up", "three warmup requests"),
+    ("fired up and ready to roll", "warming-up", "ready"),
+]
 
-def parse_image_boot_log(lines: list[str]) -> dict:
-    """The image lane's journal, reduced to the same shape parse_boot_log returns.
+
+def _parse_diffusion_boot_log(lines: list[str], markers: list, stages: tuple) -> dict:
+    """A diffusion lane's journal, reduced to the same shape parse_boot_log returns.
 
     Only the latest boot counts: journald keeps every previous life of the unit,
     and a "fired up" from yesterday must not make today's boot read as ready."""
@@ -68,15 +92,116 @@ def parse_image_boot_log(lines: list[str]) -> dict:
             start = i
     stage, detail, fired = None, "", False
     for ln in lines[start:]:
-        for needle, st, what in IMAGE_MARKERS:
+        for needle, st, what in markers:
             if needle in ln:
                 stage, detail = st, what
                 if needle == "fired up and ready to roll":
                     fired = True
-    done = list(IMAGE_STAGES[:IMAGE_STAGES.index(stage)]) if stage in IMAGE_STAGES else []
+    done = list(stages[:stages.index(stage)]) if stage in stages else []
     if fired:
-        done = list(IMAGE_STAGES)
+        done = list(stages)
     return {"stage": stage, "done": done, "fired_up": fired, "detail": detail}
+
+
+# ── The video lane's request in flight, from its own journal ──────────────────
+# The lane's API says "queued", progress 0, from the POST until the video is done: its
+# job store sets "completed" and 100 at the end and nothing in between (measured
+# 2026-09-29, and read in its video_api.py). Its journal, though, logs each pipeline
+# stage and one tqdm line per denoise step, each its own entry (one every 11 to 55 s).
+# So the phase and the step come from there, in the engine's own words and numbers.
+_ANSI = re.compile(r"\x1b\[[0-?;]*[@-~]")
+_VIDEO_STAGE = re.compile(r"\[(MiniMaxH3\w+Stage)\] (started|finished)")
+_VIDEO_STEP = re.compile(r"denoise:\s+\d+%\|[^|]*\|\s*(\d+)/(\d+)\s+\[([\d:]+)<([^,\]]+),\s*([^\]]+)\]")
+VIDEO_PHASES = ("encode", "denoise", "decode")
+VIDEO_PHASE_LABEL = {"encode": "encoding the prompt", "denoise": "denoising",
+                     "decode": "decoding video and audio"}
+_VIDEO_STAGE_PHASE = {"MiniMaxH3DenoisingStage": "denoise", "MiniMaxH3DecodingStage": "decode"}
+# a line that ends a request, whatever its outcome
+_VIDEO_RUN_END = ("Pixel data generated", "Error executing request", "Failed to generate")
+
+
+def _clock_s(txt: str) -> float | None:
+    """tqdm's [MM:SS] or [H:MM:SS] as seconds; None for its '?'."""
+    parts = txt.strip().split(":")
+    if not all(p.isdigit() for p in parts):
+        return None
+    s = 0.0
+    for p in parts:
+        s = s * 60 + int(p)
+    return s
+
+
+def _rate_s_per_step(txt: str) -> float | None:
+    """tqdm's rate as seconds per step: '14.78s/it' or '1.52it/s'; None for '?it/s'."""
+    t = txt.strip()
+    try:
+        if t.endswith("s/it"):
+            return float(t[:-4])
+        if t.endswith("it/s"):
+            v = float(t[:-4])
+            return 1.0 / v if v > 0 else None
+    except ValueError:
+        return None
+    return None
+
+
+def parse_video_run(messages: list[str]) -> dict:
+    """The request the video lane is working on, from its journal messages in time
+    order. {} when nothing runs. Otherwise the phase (encode, denoise, decode), its
+    label, and while denoising the step, the step count, tqdm's seconds per step and
+    its estimate of the time left.
+
+    A request starts at "Running pipeline stages" and ends at the line that reports its
+    outcome. A step line with no start before it still counts: the start can fall out of
+    the window read, and a step is proof enough that a request runs."""
+    run: dict | None = None
+    for raw in messages:
+        for part in _ANSI.sub("", raw).replace("\r", "\n").split("\n"):
+            if "Running pipeline stages" in part:
+                run = {"phase": "encode", "step": None, "steps": None,
+                       "s_per_step": None, "elapsed_s": None, "left_s": None}
+                continue
+            if any(k in part for k in _VIDEO_RUN_END):
+                run = None
+                continue
+            m = _VIDEO_STAGE.search(part)
+            if m and m.group(2) == "started" and m.group(1) in _VIDEO_STAGE_PHASE:
+                run = run or {"phase": "encode", "step": None, "steps": None,
+                              "s_per_step": None, "elapsed_s": None, "left_s": None}
+                run["phase"] = _VIDEO_STAGE_PHASE[m.group(1)]
+                continue
+            m = _VIDEO_STEP.search(part)
+            if m:
+                run = run or {"phase": "denoise", "step": None, "steps": None,
+                              "s_per_step": None, "elapsed_s": None, "left_s": None}
+                # the 100% line closes the denoise; decode follows at once, and saying
+                # "denoising 49/49" for the whole decode would read as stuck
+                run["phase"] = run["phase"] if run["phase"] == "decode" else "denoise"
+                run["step"], run["steps"] = int(m.group(1)), int(m.group(2))
+                run["elapsed_s"] = _clock_s(m.group(3))
+                run["left_s"] = _clock_s(m.group(4))
+                run["s_per_step"] = _rate_s_per_step(m.group(5))
+    if not run:
+        return {}
+    run["label"] = VIDEO_PHASE_LABEL[run["phase"]]
+    return run
+
+
+def parse_image_boot_log(lines: list[str]) -> dict:
+    """The image lane's journal, reduced to the same shape parse_boot_log returns.
+
+    Only the latest boot counts: journald keeps every previous life of the unit,
+    and a "fired up" from yesterday must not make today's boot read as ready."""
+    return _parse_diffusion_boot_log(lines, IMAGE_MARKERS, IMAGE_STAGES)
+
+
+def parse_video_boot_log(lines: list[str]) -> dict:
+    """The video lane's journal, reduced to the same shape parse_boot_log returns.
+
+    Same latest-boot rule as the image lane. Only the shared server lines are
+    matched; the pipeline's own component lines fall on the generic "Loading "
+    arm and read as weights without naming what they load."""
+    return _parse_diffusion_boot_log(lines, VIDEO_MARKERS, VIDEO_STAGES)
 
 
 def parse_boot_log(lines: list[str]) -> dict:
@@ -204,14 +329,18 @@ BUSY_STATES = {"starting", "loading-weights", "loading-draft", "allocating-kv",
 TRANSITIONAL = BUSY_STATES - {"ready", "degraded", "orphan", "wedged"}
 # Every unit that holds the GPU pool while it runs. The image lane is one of them:
 # 31 GB of weights, and two engines at once on 121.6 GB of unified memory is the
-# livelock this whole module exists to prevent.
-ENGINE_UNITS = ("qwen38-sglang.service", "qwen38-flash.service", "qwen38-image.service")
+# livelock this whole module exists to prevent. The video lane is one of them too:
+# about 116 GB of weights by measured components (48.09 + 61.73 + 0.56 + 5.2,
+# docs/video-lane.md), for the same reason.
+ENGINE_UNITS = ("qwen38-sglang.service", "qwen38-flash.service",
+                "qwen38-image.service", "qwen38-video.service")
 IMAGE_UNIT = "qwen38-image.service"
+VIDEO_UNIT = "qwen38-video.service"
 # The engines that serve text on ENGINE_BASE. Every probe, guard and belt that talks to
 # that port (the generation canary, the pool guard, the wedge autoheal) is about these
-# and only these: with the image lane serving, :30000 is closed, and asking "is an
+# and only these: with a diffusion lane serving, :30000 is closed, and asking "is an
 # engine ready" instead sent the canary a chat completion to a dead port every 90 s.
-TEXT_UNITS = tuple(u for u in ENGINE_UNITS if u != IMAGE_UNIT)
+TEXT_UNITS = tuple(u for u in ENGINE_UNITS if u not in (IMAGE_UNIT, VIDEO_UNIT))
 
 
 def blocked_reasons(action: str, params: dict, states: dict) -> list[str]:
@@ -259,7 +388,15 @@ def warn_reasons(action: str, params: dict, states: dict,
         elif unit == IMAGE_UNIT and state == "ready":
             # the proxy on :30001 is a text door; nothing reaches this lane through it
             warns.append("an image being generated right now is lost, and the Image "
-                         "tab has nothing to talk to until this lane is back (about 70 s)")
+                          "tab has nothing to talk to until this lane is back (about 70 s)")
+        elif unit == VIDEO_UNIT and state == "ready":
+            # same text-door reason as the image lane; a video boot is the long one
+            warns.append("a video being generated right now is lost, and the Video "
+                          "tab has nothing to talk to until this lane is back (about 12 min)")
+        elif state == "ready" and params.get("verb") == "restart":
+            # the proxy holds what reaches it while a lane's unit is on its way back (v6.28)
+            warns.append("requests on :30001 wait for it while it boots (a streamed one hears "
+                         "keepalives) and go to it once it answers")
         elif state == "ready":
             warns.append("clients on :30001 will get errors until an engine "
                          "is back")
@@ -364,6 +501,63 @@ def wedge_plan(*, decided: bool, prev_state: str | None, wedged_since: float | N
     return {"state": "wedged", "first": first, "since": since, "restart": restart}
 
 
+# ── the start guard and the zombie (pure) ───────────────────────────────────
+# Every engine unit runs engine-preflight.sh before its engine (issue #26). Its lines are in
+# the unit's journal, never in a container's log, and while it waits there is no container:
+# without them the lane read "starting" while it was held, and "keeps crashing" when it was
+# refused, which sends the operator after the wrong thing.
+PREFLIGHT_RE = re.compile(r"preflight: (?:NOT starting (\S+): (.+?), still after \d+ s\."
+                          r"|(\S+) (waits|starts): (.+))")
+
+
+def parse_preflight(lines: list[str]) -> dict | None:
+    """The guard's last word among these journal lines: {"verdict": "waits" | "refused" |
+    "starts", "reason": str}, or None when it said nothing."""
+    last = None
+    for ln in lines:
+        m = PREFLIGHT_RE.search(ln)
+        if m is None:
+            continue
+        if m.group(1) is not None:
+            last = {"verdict": "refused", "reason": m.group(2)}
+        else:
+            last = {"verdict": m.group(4), "reason": m.group(5)}
+    return last
+
+
+def preflight_flags(state: dict, *, unit_sub: str, preflight: dict | None) -> dict:
+    """The state with what the guard said, when it is why the lane is not up: held while it
+    waits (the unit runs its start step and nothing else), refused once it would not start
+    (the unit failed, or waits for its next attempt)."""
+    if not preflight:
+        return state
+    out = dict(state)
+    if preflight["verdict"] == "waits" and unit_sub == "start-pre" and state.get("state") == "starting":
+        out["held"] = preflight["reason"]
+    elif preflight["verdict"] == "refused" and state.get("state") == "failed":
+        out["refused"] = preflight["reason"]
+    return out
+
+
+def zombie_plan(*, state: str, scheduler_alive: bool | None, since: float | None, now: float,
+                after_s: float, enabled: bool, cooldown_ok: bool, job_running: bool) -> dict:
+    """What to do this tick about an engine whose server lives on without its scheduler.
+    SGLang v0.5.19 ends up so after a SIGQUIT that reaches its server while the scheduler
+    still runs (the exit is raised inside an asyncio task and swallowed; reproduced on the
+    reference box, 2026-10-01): no HTTP, no scheduler, a unit systemd calls active, and
+    nothing restarts it. Only an engine that served and stopped answering qualifies, and only
+    a read that found no scheduler (None, an unreadable process list, never does). Since the
+    start guard, a restart cannot land on memory still held, so it is safe to make.
+
+    Returns {"zombie": bool, "since": float | None, "restart": bool, "in": float}"""
+    if state != "degraded" or scheduler_alive is not False:
+        return {"zombie": False, "since": None, "restart": False, "in": 0.0}
+    since = since if since is not None else now
+    left = max(0.0, after_s - (now - since))
+    restart = bool(enabled and left == 0.0 and cooldown_ok and not job_running)
+    return {"zombie": True, "since": since, "restart": restart, "in": left}
+
+
 def decide_mem_floor(*, avail_gib: float | None, floor_gib: float, num_reqs: int,
                      last_abort_ts: float | None, now: float,
                      cooldown_s: float = 60.0) -> tuple[bool, str]:
@@ -393,6 +587,12 @@ FEED_START = re.compile(r"\[proxy\] (\S+)" + _KEY + r" -> (POST|GET) (\S+) body=
 FEED_END = re.compile(r"\[proxy\] (\S+)" + _KEY + r" (POST|GET) (\S+) (.+?) in ([\d.]+)s")
 FEED_REFUSED = re.compile(r"\[proxy\] (\S+)" + _KEY + r" REFUSED oversize \(\d+b, (.+?), limit (\d+)\)")
 FEED_FIT = re.compile(r"\[proxy\] (\S+)" + _KEY + r" oversize check: (\d+) tokens fit \((\d+) usable")
+# The proxy writes one end line per request (since 30/08), so a start loses its end only
+# when the process that took it is gone, and that is logged as well: systemd says it has
+# stopped or lost the process ("Stopped" names the unit only since systemd 252, its
+# description before), and the next proxy introduces itself with its banner.
+FEED_PROXY_GONE = re.compile(r"\]: \[proxy\] v[\d.]+ on |systemd\[\d+\]: (?:Stopped |\S+: (?:Deactivated "
+                             r"successfully|Main process exited|Failed with result))")
 
 
 # How an outcome reads, so the UI never has to match strings itself (it did, and it
@@ -403,6 +603,8 @@ FEED_FIT = re.compile(r"\[proxy\] (\S+)" + _KEY + r" oversize check: (\d+) token
 #   fail    the request did not get an answer: the engine, the guard or the stream
 #   live    still in flight
 #   unknown no end line was ever written (a proxy restart mid-request)
+#   probe   the cockpit's own route probe, refused at the schema as it is meant to be
+#           (mark_probes): no client asked anything
 def outcome_kind(outcome: str) -> str:
     if outcome == "in flight":
         return "live"
@@ -417,59 +619,101 @@ def outcome_kind(outcome: str) -> str:
     return "fail"
 
 
-def parse_feed(raw: str, last: int = 25) -> list[dict]:
+def mark_probes(rows: list[dict], path: str, size: int) -> list[dict]:
+    """The cockpit's own probe of a route, in the request log: a request from this box to
+    `path` carrying the probe's exact body, refused with a 422 at the schema as designed
+    (it has no state, so no model runs). It read as a failed client request, in red, once
+    a minute while the Decide view was open (2026-09-30). Rows are marked in place."""
+    for r in rows:
+        if (r.get("path") == path and r.get("bytes") == size
+                and str(r.get("peer", "")).startswith("127.0.0.1:")
+                and str(r.get("outcome", "")).startswith("422")):
+            r["kind"] = "probe"
+            r["outcome"] = "422 as designed: the cockpit's probe"
+    return rows
+
+
+def _feed_open(records: list[dict], method: str | None = None,
+               path: str | None = None) -> dict | None:
+    """Newest still-open record for one peer, preferring the same route.
+
+    Two requests can share a peer: a reused keep-alive connection serves them
+    one after the other, and multiplexing serves them side by side. The old
+    single record per peer let the second start overwrite the first, then let
+    the first end mark the second as done (found live, 2026-09-29: the feed
+    showed 6 in flight for 7 requests on the engine)."""
+    open_recs = [r for r in records if r["outcome"] == "in flight"]
+    if method is not None or path is not None:
+        same = [r for r in open_recs
+                if (method is None or r.get("method") == method)
+                and (path is None or r.get("path") == path)]
+        if same:
+            return same[-1]
+    return open_recs[-1] if open_recs else None
+
+
+def parse_feed(raw: str, last: int = 25, carry: list[dict] | None = None) -> list[dict]:
     """journalctl text of the keepalive proxy -> the last requests: client, path,
     size, outcome, seconds, and the guard's detail when it counted the prompt
-    (tokens counted vs the lane's limit) so a 400 explains itself."""
-    reqs: dict[str, dict] = {}
-    order: list[str] = []
-    latest_ts = None
-    for ln in raw.splitlines():
+    (tokens counted vs the lane's limit) so a 400 explains itself.
+
+    The last `last` requests, and every older one still in flight with them. `carry` is
+    what the previous read left in flight: a request whose start is older than this
+    read's first line can still end in it. Both exist for the rail's badge and the table,
+    which count the rows in flight: with eight agents, a generation that outlasted the
+    25 newest requests (34 minutes, 2026-10-02) dropped out of both while the engine
+    still ran it, and the badge fell from 8 to 2."""
+    reqs: dict[str, list[dict]] = {}
+    order: list[tuple[str, int]] = []
+    lines = raw.splitlines()
+    first_ts = next((ln[:19] for ln in lines if ln[:4].isdigit()), None)
+    for rec in carry or ():
+        # a start still inside this read is read again from its own line
+        if rec.get("outcome") == "in flight" and (first_ts is None or str(rec.get("ts", ""))[:19] < first_ts):
+            reqs.setdefault(rec["peer"], []).append(dict(rec))
+            order.append((rec["peer"], len(reqs[rec["peer"]]) - 1))
+    for ln in lines:
         ts = ln[:19]
-        if len(ts) == 19 and ts[10] == "T":
-            latest_ts = ts
+        # A start with no end stays "in flight" for as long as the proxy that took it runs:
+        # a generation has no deadline, and one queued behind seven others answered after 22
+        # minutes. The clock this replaced (10 minutes of newer traffic) called five live
+        # requests "no end logged" while the engine ran three and queued two (01/10).
+        if FEED_PROXY_GONE.search(ln):
+            for records in reqs.values():
+                for r in records:
+                    if r["outcome"] == "in flight":
+                        r["outcome"], r["kind"] = "no end logged", "unknown"
+                        r["detail"] = "; ".join(filter(None, (r["detail"], "the proxy that took it stopped")))
+            continue
         m = FEED_START.search(ln)
         if m:
             peer = m.group(1)
-            reqs[peer] = {"ts": ts, "peer": peer, "path": m.group(3), "bytes": int(m.group(4)),
-                          "outcome": "in flight", "kind": "live", "secs": None, "detail": None}
-            order.append(peer)
+            rec = {"ts": ts, "peer": peer, "method": m.group(2), "path": m.group(3),
+                   "bytes": int(m.group(4)),
+                   "outcome": "in flight", "kind": "live", "secs": None, "detail": None}
+            reqs.setdefault(peer, []).append(rec)
+            order.append((peer, len(reqs[peer]) - 1))
             continue
         m = FEED_REFUSED.search(ln)
         if m and m.group(1) in reqs:
-            reqs[m.group(1)]["detail"] = f"{m.group(2)}, limit {int(m.group(3)):,}"
+            r = _feed_open(reqs[m.group(1)]) or reqs[m.group(1)][-1]
+            r["detail"] = f"{m.group(2)}, limit {int(m.group(3)):,}"
             continue
         m = FEED_FIT.search(ln)
         if m and m.group(1) in reqs:
-            reqs[m.group(1)]["detail"] = f"{int(m.group(2)):,} tokens counted, fits ({int(m.group(3)):,} usable)"
+            r = _feed_open(reqs[m.group(1)]) or reqs[m.group(1)][-1]
+            r["detail"] = f"{int(m.group(2)):,} tokens counted, fits ({int(m.group(3)):,} usable)"
             continue
         m = FEED_END.search(ln)
         if m and m.group(1) in reqs:
-            r = reqs[m.group(1)]
+            r = _feed_open(reqs[m.group(1)], m.group(2), m.group(3))
+            if r is None:
+                continue
             r["outcome"] = m.group(4)[:40]
             r["kind"] = outcome_kind(r["outcome"])
             r["secs"] = float(m.group(5))
-    # A start with no end cannot stay "in flight" forever: the proxy guarantees an
-    # end line per request since 30/08, but a proxy restart mid-request (or an older
-    # journal) can still orphan one. After 10 minutes of newer traffic it becomes an
-    # explicit unknown so the live count stays honest.
-    if latest_ts:
-        try:
-            latest = datetime.fromisoformat(latest_ts)
-        except ValueError:
-            latest = None
-        if latest:
-            for r in reqs.values():
-                if r["outcome"] != "in flight":
-                    continue
-                try:
-                    age = (latest - datetime.fromisoformat(r["ts"])).total_seconds()
-                except ValueError:
-                    continue
-                if age > 600:
-                    r["outcome"] = "no end logged"
-                    r["kind"] = "unknown"
-    return [reqs[p] for p in order[-last:]]
+    older_live = [(p, i) for p, i in (order[:-last] if last > 0 else []) if reqs[p][i]["outcome"] == "in flight"]
+    return [reqs[p][i] for p, i in older_live + order[-last:]]
 
 
 # ── zombie guard: what a client that gave up cost the engine (pure) ─────────

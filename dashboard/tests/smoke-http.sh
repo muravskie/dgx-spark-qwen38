@@ -41,8 +41,12 @@ n = len(bltin)
 # Serving-flag drift is only ever excused as checkpoint-driven (another target
 # needs another kv/moe/quant pair by design); the served target itself must
 # match its recipe exactly, so at least one builtin reads fully clean.
+# drafter.quantization is in: like the quantization pair, it belongs to the
+# checkpoint itself (recipes.py says so), and the nvidia export carries none
+# while the RadixArk one it is compared against serves unquant.
 allowed = {"model.repo", "model.revision", "serve.kv_cache_dtype",
-           "serve.moe_runner_backend", "serve.quantization"}
+           "serve.moe_runner_backend", "serve.quantization",
+           "drafter.quantization"}
 exact = [b["recipe"]["id"] for b in bltin if not (b["drift"] or [])]
 bad = [b["recipe"]["id"] + ":" + ",".join(sorted(x["key"] for x in b["drift"]))
        for b in bltin if {x["key"] for x in (b["drift"] or [])} - allowed]
@@ -52,9 +56,9 @@ print("ok" if n == int("'"$NTARGETS"'") and exact and not bad else
 # The switch itself is not run here: this asks the validator, not the box.
 ck "chaque cible du selecteur est acceptee par l'action" "ok" "$(python3 - <<'PYEOF'
 import json, re, pathlib, subprocess, sys
-html = pathlib.Path("dashboard/static/index.html").read_text()
-m = re.search(r'<select id="switchsel".*?</select>', html, re.S)
-ui = re.findall(r'<option value="([^"]+)"', m.group(0))
+jsc = pathlib.Path("dashboard/static/js/base.js").read_text()
+m = re.search(r"const LANE_TARGETS = \{(.*?)\};", jsc, re.S)
+ui = re.findall(r"'([a-z0-9|-]+)'", m.group(1))
 cock = pathlib.Path("dashboard/cockpit.py").read_text()
 m = re.search(r'"switch":\s*\{.*?"params":\s*\{"target":\s*\[(.*?)\]\}', cock, re.S)
 enum = re.findall(r'"([^"]+)"', m.group(1))
@@ -99,6 +103,7 @@ read -r AG_ON AG_BIND AG_PORT AG_LISTEN <<<"$AG"
 if [ "$AG_ON" = "1" ] && [ "$AG_LISTEN" = "1" ]; then
   # the session cookie is per host: log in again through the relay's own address
   CB="http://$AG_BIND:${BASE##*:}"; R="http://$AG_BIND:$AG_PORT"; J2="$(mktemp)"
+  trap 'rm -f "$J" "$J2"' EXIT   # this jar holds a session cookie too: not left in /tmp
   if [ "$(code -c "$J2" -X POST "$CB/api/login" -H 'Content-Type: application/json' -d "{\"key\":\"$KEY\"}")" = "200" ]; then
     ck "relais sans session"        401 "$(code "$R/global/health")"
     ck "relais page de connexion"   401 "$(code -H 'Accept: text/html' "$R/")"

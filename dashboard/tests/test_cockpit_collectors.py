@@ -250,6 +250,17 @@ class Parse(Base):
         self.assertIsNone(out["temp_c"])
         self.assertEqual(out["procs"], [])
 
+    def test_gpu_that_did_not_answer_has_no_process_list(self):
+        """An empty list is a GPU with nothing on it: a query that timed out is no list, or
+        the page says "No process on the GPU" of a box it could not read (2026-10-02)."""
+        def silent(argv, timeout=5.0, merge_err=False):
+            r = self.cp.Ran("")
+            r.ok = False
+            return r
+        self.cp.run = silent
+        out = self.cp.collect_gpu()
+        self.assertEqual((out["power_w"], out["temp_c"], out["procs"]), (None, None, None), out)
+
     def test_feed_reads_the_keepalive_journal(self):
         self.box({"journalctl -u qwen38-keepalive.service": fixture("keepalive-journal.txt")})
         out = self.cp.collect_feed()
@@ -258,6 +269,53 @@ class Parse(Base):
         for r in out["rows"]:
             self.assertIn("kind", r)
             self.assertIn(r["kind"], ("ok", "gone", "fail", "live", "unknown"))
+
+    def test_feed_keeps_a_long_request_after_its_start_left_the_window(self):
+        """The badge and the table count the rows in flight. The first read goes back to the
+        proxy's start; later ones read the 800 newest lines and carry what was in flight, so
+        a generation whose start left the window stays counted and its end lands
+        (2026-10-02: 8 in flight at the proxy and the engine, 2 in the cockpit's rows)."""
+        L = "2026-10-02T23:{m:02d}:{s:02d}+02:00 gx10 python3[1]: [proxy] {rest}"
+        start = L.format(m=16, s=1, rest="127.0.0.1:49398 -> POST /v1/chat/completions body=111922b")
+        short = lambda m: [L.format(m=m, s=i, rest=f"127.0.0.1:{41000 + m * 60 + i} -> POST /v1/chat/completions body=9b")
+                           for i in range(30)] + [L.format(m=m, s=i, rest=f"127.0.0.1:{41000 + m * 60 + i} POST /v1/chat/completions ok in 1.0s")
+                                                   for i in range(30)]
+        end = L.format(m=49, s=49, rest="127.0.0.1:49398 POST /v1/chat/completions ok in 2028.0s")
+        calls, answers = [], {"since": "\n".join([start] + short(20)), "window": "\n".join(short(40))}
+
+        def fake(argv, timeout=5.0, merge_err=False):
+            calls.append(list(argv))
+            if argv[:2] == ["systemctl", "show"]:
+                return "@1790974535\n"
+            return answers["since"] if "--since" in argv else answers["window"]
+        self.cp.run = fake
+        self.cp.FEED_CARRY.clear()
+        self.cp.FEED_BOOTED[0] = False
+        live = lambda out: [r["peer"] for r in out["rows"] if r["outcome"] == "in flight"]
+        out = self.cp.collect_feed()
+        self.assertIn("--since", calls[-1])
+        self.assertEqual(calls[-1][calls[-1].index("--since") + 1], "@1790974535")
+        self.assertEqual(live(out), ["127.0.0.1:49398"])
+        out = self.cp.collect_feed()
+        self.assertNotIn("--since", calls[-1])
+        self.assertEqual(calls[-1][calls[-1].index("-n") + 1], "800")
+        self.assertEqual(live(out), ["127.0.0.1:49398"], "the window no longer holds its start")
+        # its end lands on the carried start (a few newer requests: it is among the 25 newest)
+        answers["window"] = "\n".join(short(41)[:3] + short(41)[30:33] + [end])
+        out = self.cp.collect_feed()
+        self.assertEqual(live(out), [])
+        self.assertIn(("127.0.0.1:49398", "ok", 2028.0), [(r["peer"], r["outcome"], r["secs"]) for r in out["rows"]])
+
+    def test_a_first_feed_read_that_timed_out_is_tried_again(self):
+        def silent(argv, timeout=5.0, merge_err=False):
+            r = self.cp.Ran("" if argv[0] == "journalctl" else "@1790974535\n")
+            r.ok = argv[0] != "journalctl"
+            return r
+        self.cp.run = silent
+        self.cp.FEED_CARRY.clear()
+        self.cp.FEED_BOOTED[0] = False
+        self.cp.collect_feed()
+        self.assertFalse(self.cp.FEED_BOOTED[0], "the read since the proxy's start is still to do")
 
     def test_decode_telemetry_needs_a_running_container_to_say_anything(self):
         self.box({})            # docker ps -q answers nothing: no lane is up
@@ -657,6 +715,156 @@ class TheBootBarNeverGoesBack(Base):
 
 
 
+class TheLaneSaysWhyTheStartGuardHoldsIt(Base):
+    """engine-preflight.sh writes to the unit's journal, and while it waits there is no
+    container, so the container log the lifecycle reads never had its reason: a held lane
+    read "starting", a refused one "keeps crashing" (issue #26)."""
+    U = "qwen38-sglang.service"
+    W = ("preflight: qwen38-sglang.service waits: what is left of an engine still holds 16 GiB of GPU "
+         "memory: 1756018 sglang::stuck 16578 MiB\n")
+    R = ("preflight: NOT starting qwen38-sglang.service: the GPU driver holds 50.9 GiB that no process "
+         "accounts for, still after 60 s. Starting into memory the driver has not given back is how "
+         "sglang#40948 froze a DGX Spark until a power cycle. Stop what holds it, or reboot if nothing "
+         "does; systemd tries again in 15 s.\n")
+
+    def setUp(self):
+        self.cp.BOOT_SEEN.clear()
+        with self.cp.STATE_LOCK:
+            self.cp.STATE["engine_fast"] = {"data": {"healthy": False}}
+
+    def tick(self, active, sub, journal, container=""):
+        fake = self.box({f"systemctl show {self.U}": f"ActiveState={active}\nSubState={sub}\n"
+                                                     "ActiveEnterTimestampMonotonic=0\nInvocationID=abc123\n",
+                         "docker ps -q -f name=^qwen38-sglang$": container,
+                         "_SYSTEMD_INVOCATION_ID=abc123": journal})
+        out = self.cp.collect_lifecycle()
+        return out.get("data", out)["engines"][self.U], fake
+
+    def test_held_while_it_waits(self):
+        e, fake = self.tick("activating", "start-pre", self.W)
+        self.assertEqual(e["state"], "starting")
+        self.assertEqual(e["held"], "what is left of an engine still holds 16 GiB of GPU memory: "
+                                    "1756018 sglang::stuck 16578 MiB")
+        self.assertIsNone(e["refused"])
+        reads = [c for c in fake.calls if c[:1] == ["journalctl"] and self.U in c]
+        self.assertEqual(len(reads), 1)
+        self.assertIn("-g", reads[0])
+        self.assertIn("_SYSTEMD_INVOCATION_ID=abc123", reads[0], "this run's lines, never an older run's")
+
+    def test_refused_between_two_attempts(self):
+        e, _ = self.tick("activating", "auto-restart", self.R)
+        self.assertEqual((e["state"], e["restarting"]), ("failed", True))
+        self.assertEqual(e["refused"], "the GPU driver holds 50.9 GiB that no process accounts for")
+        self.assertIsNone(e["held"])
+
+    def test_a_lane_that_is_simply_starting_has_no_reason(self):
+        e, _ = self.tick("activating", "start-pre", "")
+        self.assertEqual(e["state"], "starting")
+        self.assertIsNone(e["held"])
+
+    def test_a_serving_lane_never_reads_it(self):
+        _, fake = self.tick("active", "running", self.W, container="c0ffee\n")
+        self.assertFalse([c for c in fake.calls if c[:1] == ["journalctl"] and self.U in c and "-g" in c])
+
+
+class AServerWithoutItsSchedulerIsRestartedOnce(Base):
+    """SGLang v0.5.19 can be left with its server process alive and no scheduler (a SIGQUIT
+    that reaches the server while the scheduler runs; reproduced on the reference box,
+    2026-10-01): no HTTP, a unit systemd calls active, and nothing restarts it."""
+    U = "qwen38-sglang.service"
+    FIRED = ("[2026-10-01 12:12:30] Load weight end. elapsed=119.55 s\n"
+             "[2026-10-01 12:17:42] The server is fired up and ready to roll!\n")
+
+    def setUp(self):
+        self.cp.BOOT_SEEN.clear()
+        self.cp.BOOT_HEAD_READ.clear()
+        self.cp.ZOMBIE_SINCE.clear()
+        self.cp.LAST_ZOMBIE_RESTART.clear()
+        self.actions = []
+        real_alive, real_start = self.cp.scheduler_alive, self.cp.start_action
+        self.addCleanup(setattr, self.cp, "scheduler_alive", real_alive)
+        self.addCleanup(setattr, self.cp, "start_action", real_start)
+        self.cp.start_action = lambda kind, args, origin="": (self.actions.append((kind, args, origin)), (0, "ok"))[1]
+        self.alive = False
+        self.cp.scheduler_alive = lambda container: self.alive
+
+    def tick(self):
+        with self.cp.STATE_LOCK:
+            self.cp.STATE["engine_fast"] = {"data": {"healthy": False}}
+        with self.cp.LIFE_LOCK:
+            self.cp.LIFE["states"] = {self.U: "degraded"}
+        self.cp.UNHEALTHY_TICKS[self.U] = 5
+        self.cp.LAST_PROGRESS["ts"] = None
+        self.box({f"systemctl show {self.U}": "ActiveState=active\nSubState=running\n"
+                                              "ActiveEnterTimestampMonotonic=1000\nInvocationID=abc\n",
+                  "docker ps -q -f name=^qwen38-sglang$": "c0ffee\n",
+                  "docker logs --tail 300 qwen38-sglang": self.FIRED,
+                  "docker logs --since": self.FIRED})
+        out = self.cp.collect_lifecycle()
+        return out.get("data", out)["engines"][self.U]
+
+    def test_it_is_named_then_restarted_once_after_its_delay(self):
+        e = self.tick()
+        self.assertEqual((e["state"], e["zombie"], e["zombie_in"]), ("degraded", True, 120))
+        self.assertEqual(self.actions, [])
+        self.cp.ZOMBIE_SINCE[self.U] = __import__("time").time() - 121
+        self.tick()
+        self.assertEqual(self.actions, [("unit", {"verb": "restart", "unit": self.U}, "zombie")])
+        self.tick()
+        self.assertEqual(len(self.actions), 1, "one restart per half hour, not one per tick")
+
+    def test_a_server_with_its_scheduler_is_left_alone(self):
+        self.alive = True
+        e = self.tick()
+        self.assertFalse(e["zombie"])
+        self.assertNotIn(self.U, self.cp.ZOMBIE_SINCE)
+        self.alive = None                     # an unreadable process list decides nothing
+        self.assertFalse(self.tick()["zombie"])
+        self.assertEqual(self.actions, [])
+
+    def test_off_it_says_so_and_does_nothing(self):
+        self.cp.ZOMBIE_RESTART = False
+        self.addCleanup(setattr, self.cp, "ZOMBIE_RESTART", True)
+        self.cp.ZOMBIE_SINCE[self.U] = __import__("time").time() - 600
+        self.assertTrue(self.tick()["zombie"])
+        self.assertEqual(self.actions, [])
+
+
+class ACrashWhileServingIsNoCrashLoop(Base):
+    """A serving engine that crashes waits 15 s for its next attempt, exactly like a boot that
+    keeps dying, and the page said "keeps crashing, it dies during startup" for both (seen
+    2026-10-01 after one crash of the serving flash lane). The lane tells them apart now."""
+    U = "qwen38-sglang.service"
+
+    def tick(self, active, sub, prev):
+        with self.cp.LIFE_LOCK:
+            self.cp.LIFE["states"] = {self.U: prev}
+        with self.cp.STATE_LOCK:
+            self.cp.STATE["engine_fast"] = {"data": {"healthy": False}}
+        self.box({f"systemctl show {self.U}": f"ActiveState={active}\nSubState={sub}\n"
+                                              "ActiveEnterTimestampMonotonic=0\nInvocationID=abc\nNRestarts=1\n",
+                  "docker ps -q -f name=^qwen38-sglang$": ""})
+        out = self.cp.collect_lifecycle()
+        return out.get("data", out)["engines"][self.U]
+
+    def test_down_while_serving_then_down_at_boot(self):
+        self.cp.CRASHED_SERVING.clear()
+        e = self.tick("activating", "auto-restart", "ready")
+        self.assertEqual((e["state"], e["restarting"], e["crashed_serving"]), ("failed", True, True))
+        e = self.tick("activating", "auto-restart", "failed")       # the rest of the same 15 s
+        self.assertTrue(e["crashed_serving"])
+        e = self.tick("activating", "start", "failed")              # the next attempt boots
+        self.assertEqual((e["state"], e["crashed_serving"]), ("starting", False))
+        e = self.tick("activating", "auto-restart", "starting")     # and dies at boot: a loop
+        self.assertEqual((e["state"], e["restarting"], e["crashed_serving"]), ("failed", True, False))
+
+    def test_a_degraded_or_wedged_engine_that_goes_down_was_serving_too(self):
+        for prev in ("degraded", "wedged"):
+            with self.subTest(prev=prev):
+                self.cp.CRASHED_SERVING.clear()
+                self.assertTrue(self.tick("activating", "auto-restart", prev)["crashed_serving"])
+
+
 class AWedgedEngineThatLosesHealthIsDegraded(Base):
     """A wedge is only reachable from ready, so when that engine also stops answering it has
     long been serving: "degraded". The check that keeps a fresh boot in warming-up did not
@@ -684,6 +892,112 @@ class AWedgedEngineThatLosesHealthIsDegraded(Base):
         self.assertEqual(out.get("data", out)["engines"][self.U]["state"], "degraded")
 
 
+class ACockpitRestartFacingAServingEngine(Base):
+    """Every cockpit restart logged "warming-up -> ready" for the serving lane two seconds
+    later (five times in the event log of 2026-09-29/30). The lifecycle tier's first pass
+    ran before the first health sample existed, read "no sample" as "unhealthy", and
+    turned the "degraded" that gave into "warming-up", having no previous state. And an
+    engine that really was not answering when the cockpit came up read "warming up" for as
+    long as it lasted: a boot state, which holds every switch back."""
+    U = "qwen38-flash.service"
+    FIRED = ("[2026-09-30 15:16:03] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 491136\n"
+             "[2026-09-30 15:16:35] The server is fired up and ready to roll!\n")
+    NOW = 100_000.0
+
+    def setUp(self):
+        self.cp.BOOT_HEAD_READ.clear()
+        self.cp.BOOT_SEEN.clear()
+        self.cp.UNHEALTHY_TICKS.clear()
+        self.cp.LAST_PROGRESS["ts"] = None
+        with self.cp.LIFE_LOCK:
+            self.cp.LIFE["states"], self.cp.LIFE["witnessed"], self.cp.LIFE["enter"] = {}, {}, {}
+        (self.tmp / self.cp.HISTORY_FILE_NAME).unlink(missing_ok=True)
+        self.saved_mono = self.cp.monotonic_now
+        self.cp.monotonic_now = lambda: self.NOW
+
+    def tearDown(self):
+        self.cp.monotonic_now = self.saved_mono
+        (self.tmp / self.cp.HISTORY_FILE_NAME).unlink(missing_ok=True)
+        super().tearDown()
+
+    def tick(self, healthy, age_s):
+        with self.cp.STATE_LOCK:
+            self.cp.STATE["engine_fast"] = {"data": {"healthy": healthy}}
+        enter = int((self.NOW - age_s) * 1e6)
+        self.box({f"systemctl show {self.U}": "ActiveState=active\nSubState=running\n"
+                                              f"ActiveEnterTimestampMonotonic={enter}\n",
+                  "docker ps -q -f name=^qwen38-flash$": "c0ffee\n",
+                  "docker logs --tail 300 qwen38-flash": self.FIRED,
+                  "docker logs --since": self.FIRED})
+        out = self.cp.collect_lifecycle()
+        return out.get("data", out)
+
+    def test_the_other_tiers_start_once_health_has_been_sampled(self):
+        import threading
+        import time
+        seen = []
+        with self.cp.STATE_LOCK:
+            self.cp.STATE.pop("engine_fast", None)
+
+        def spawn(period, cols):
+            if "engine_fast" in cols:
+                def first_sample():
+                    time.sleep(0.3)
+                    with self.cp.STATE_LOCK:
+                        self.cp.STATE["engine_fast"] = {"data": {"healthy": True}}
+                threading.Thread(target=first_sample, daemon=True).start()
+                return
+            with self.cp.STATE_LOCK:
+                seen.append((tuple(cols), "engine_fast" in self.cp.STATE))
+        self.cp.start_samplers(spawn=spawn, wait_s=5)
+        rest = [t for t in self.cp.TIERS if "engine_fast" not in t[1]]
+        deadline = time.time() + 6
+        while len(seen) < len(rest) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(len(seen), len(rest), seen)
+        self.assertTrue(all(had for _, had in seen), seen)
+        self.assertIn((("lifecycle",), True), seen)
+
+    def test_a_health_tier_that_never_answers_does_not_hold_the_others_back(self):
+        import time
+        started = []
+        with self.cp.STATE_LOCK:
+            self.cp.STATE.pop("engine_fast", None)
+        self.cp.start_samplers(spawn=lambda period, cols: started.append(tuple(cols)), wait_s=0.2)
+        deadline = time.time() + 3
+        while len(started) < len(self.cp.TIERS) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(len(started), len(self.cp.TIERS), started)
+
+    def test_an_engine_fired_up_hours_ago_and_silent_is_degraded(self):
+        d = self.tick(healthy=False, age_s=3 * 3600)
+        self.assertEqual(d["engines"][self.U]["state"], "degraded")
+        self.assertNotIn("switch", d["blocked"], "a lane that has served is no boot in progress")
+
+    def test_an_activation_younger_than_a_boot_still_reads_warming_up(self):
+        d = self.tick(healthy=False, age_s=60)
+        self.assertEqual(d["engines"][self.U]["state"], "warming-up")
+        self.assertIn("switch", d["blocked"], "a warm-up holds the switch back, which is why the line matters")
+
+    def test_a_boot_this_cockpit_watched_keeps_its_warm_up(self):
+        with self.cp.LIFE_LOCK:
+            self.cp.LIFE["witnessed"][self.U] = True
+        d = self.tick(healthy=False, age_s=3 * 3600)
+        self.assertEqual(d["engines"][self.U]["state"], "warming-up")
+
+    def test_the_line_is_the_boxs_own_median_boot_plus_the_grace(self):
+        (self.tmp / self.cp.HISTORY_FILE_NAME).write_text(json.dumps({self.U: [600.0, 610.0, 620.0]}))
+        edge = 610.0 + self.cp.WARMUP_GRACE_S
+        self.assertEqual(self.tick(healthy=False, age_s=edge - 5)["engines"][self.U]["state"], "warming-up")
+        with self.cp.LIFE_LOCK:
+            self.cp.LIFE["states"] = {}
+        self.assertEqual(self.tick(healthy=False, age_s=edge + 5)["engines"][self.U]["state"], "degraded")
+
+    def test_an_engine_that_answers_is_ready_at_the_first_pass(self):
+        d = self.tick(healthy=True, age_s=3 * 3600)
+        self.assertEqual(d["engines"][self.U]["state"], "ready")
+
+
 class AStopTimeoutIsNotACrash(Base):
     """A unit systemd killed because it did not stop in time ends "failed" with
     Result=timeout: that is how a Stop during a generation looked on 2026-09-23, and the
@@ -699,7 +1013,7 @@ class AStopTimeoutIsNotACrash(Base):
         self.assertEqual((e["state"], e["result"]), ("failed", "timeout"))
 
     def test_the_page_tells_a_stop_timeout_from_a_crash(self):
-        js = (REPO / "dashboard" / "static" / "app.js").read_text()
+        js = (REPO / "dashboard" / "static" / "js" / "base.js").read_text()
         self.assertIn("e.state === 'failed' && e.result === 'timeout'", js)
         self.assertIn("was killed while stopping.", js)
 
@@ -820,7 +1134,8 @@ class TheEngineIsAskedItsCurrentRoutes(Base):
     def test_a_current_engine_gives_the_old_shape_from_the_new_route(self):
         seen = self.engine({"/v1/loads?include=core", "/server_info"})
         self.assertEqual(self.cp.engine_load(), [{"dp_rank": 0, "num_reqs": 3, "num_waiting_reqs": 1,
-                                                  "num_tokens": 500, "num_pending_tokens": 100}])
+                                                  "num_tokens": 500, "num_used_tokens": 400,
+                                                  "num_pending_tokens": 100}])
         self.assertEqual(self.cp.engine_server_info(timeout=3)["max_total_num_tokens"], 900000)
         self.assertEqual(seen, ["/v1/loads?include=core", "/server_info"], "a deprecated route was asked")
 
@@ -846,6 +1161,96 @@ class TheEngineIsAskedItsCurrentRoutes(Base):
         with self.assertRaises(Exception):
             self.cp.engine_load()
         self.assertEqual(self.cp.ENGINE_ROUTES["load"], "/v1/loads?include=core")
+
+
+class AnEngineThatServedLosesHealthAsDegraded(Base):
+    """The cockpit reads an engine's log only while its health is down, so in a boot it
+    watched, the last stage it saw was the one before "fired up". When the engine lost health
+    later with no milestone left in the last 300 lines (a crash's tracebacks), that stage came
+    back: the lane read "capturing graphs", a boot, and the zombie restart, which follows
+    "degraded" only, never came (the reference box, 2026-10-01)."""
+    U = "qwen38-flash.service"
+    # the flash lane's own lines, from its journal of 2026-10-01
+    BOOTING = ("[2026-10-01 19:23:17] Load weight begin. avail mem=109.83 GB\n"
+               "[2026-10-01 19:30:58] Load weight end. elapsed=461.30 s, type=Qwen4ExpForConditionalGeneration, "
+               "quant=modelopt_fp4, quant_algo=NVFP4, avail mem=30.04 GB\n"
+               "[2026-10-01 19:32:30] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 482176, K size: 5.52 GB\n"
+               "[2026-10-01 19:33:06] Capture target verify CUDA graph begin. backend=full, num_tokens_per_req=4, "
+               "bs=[1, 2, 3, 4, 5, 6, 7, 8], avail mem=12.92 GB\n")
+    CRASH = ("Traceback (most recent call last):\n"
+             '  File "/usr/lib/python3.12/asyncio/locks.py", line 212, in wait\n'
+             "    await fut\n"
+             "asyncio.exceptions.CancelledError\n") * 70
+
+    def setUp(self):
+        for d in (self.cp.BOOT_SEEN, self.cp.BOOT_HEAD_READ, self.cp.ZOMBIE_SINCE):
+            d.clear()
+        real_alive = self.cp.scheduler_alive
+        self.addCleanup(setattr, self.cp, "scheduler_alive", real_alive)
+        self.cp.scheduler_alive = lambda container: True     # a scheduler: no zombie here
+
+    def tick(self, healthy, tail, prev):
+        with self.cp.STATE_LOCK:
+            self.cp.STATE["engine_fast"] = {"data": {"healthy": healthy}}
+        with self.cp.LIFE_LOCK:
+            self.cp.LIFE["states"] = {self.U: prev}
+        self.cp.UNHEALTHY_TICKS[self.U] = 0 if healthy else 5
+        self.cp.LAST_PROGRESS["ts"] = None
+        self.box({f"systemctl show {self.U}": "ActiveState=active\nSubState=running\n"
+                                              "ActiveEnterTimestampMonotonic=1000\nInvocationID=abc\n",
+                  "docker ps -q -f name=^qwen38-flash$": "c0ffee\n",
+                  "docker logs --tail 300 qwen38-flash": tail,
+                  "docker logs --since": tail})
+        out = self.cp.collect_lifecycle()
+        return out.get("data", out)["engines"][self.U]["state"]
+
+    def test_a_boot_it_watched_then_served_reads_degraded_once_health_goes(self):
+        self.assertEqual(self.tick(False, self.BOOTING, "loading-weights"), "capturing-graphs")
+        self.assertEqual(self.tick(True, "", "capturing-graphs"), "ready")
+        self.assertEqual(self.tick(False, self.CRASH, "ready"), "degraded")
+
+    def test_a_boot_that_never_served_still_reads_its_stage(self):
+        self.assertEqual(self.tick(False, self.BOOTING, "loading-weights"), "capturing-graphs")
+        self.assertEqual(self.tick(False, self.CRASH, "capturing-graphs"), "capturing-graphs")
+
+
+class TheSchedulerProbeAsksDockerTheWayItAnswers(Base):
+    """scheduler_alive() against a docker that answers as the daemon does. `docker top`
+    refuses a field list without the PID ("Couldn't find PID field in ps output"): asked for
+    `comm` alone, the probe never answered on the reference box, so no zombie was ever
+    decided there. The tests above stand a lambda in for the probe and could not see it
+    (found by the end-to-end test of a real zombie, 2026-10-01)."""
+
+    DOCKER = """#!/bin/sh
+[ "$1" = top ] || exit 2
+c="$2"; shift 2
+[ "$1" = -eo ] || { echo "unexpected: $*" >&2; exit 2; }
+case ",$2," in
+  *,pid,*) ;;
+  *) echo "Error response from daemon: Couldn't find PID field in ps output" >&2; exit 1 ;;
+esac
+case "$c" in
+  serving) printf 'PID                 COMMAND\n2218964             python3\n2220142             sglang::schedul\n' ;;
+  zombie) printf 'PID                 COMMAND\n2218964             python3\n' ;;
+  *) echo "Error response from daemon: No such container: $c" >&2; exit 1 ;;
+esac
+"""
+
+    def setUp(self):
+        bin_dir = Path(tempfile.mkdtemp(prefix="fake-docker-"))
+        self.addCleanup(shutil.rmtree, bin_dir, True)
+        (bin_dir / "docker").write_text(self.DOCKER)
+        (bin_dir / "docker").chmod(0o755)
+        path = os.environ["PATH"]
+        self.addCleanup(os.environ.__setitem__, "PATH", path)
+        os.environ["PATH"] = f"{bin_dir}:{path}"
+
+    def test_a_scheduler_listed_is_alive_and_one_gone_is_not(self):
+        self.assertIs(self.cp.scheduler_alive("serving"), True)
+        self.assertIs(self.cp.scheduler_alive("zombie"), False)
+
+    def test_a_container_it_cannot_read_decides_nothing(self):
+        self.assertIsNone(self.cp.scheduler_alive("gone"))
 
 
 if __name__ == "__main__":

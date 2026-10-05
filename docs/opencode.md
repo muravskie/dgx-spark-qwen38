@@ -6,7 +6,7 @@ The installer writes a complete, ready-to-use [opencode](https://opencode.ai) co
 
 A box with no opencode config of its own gets this one as `~/.config/opencode/opencode.json`
 (since v1.18.4: before, it was printed as a `cp` command, and a first install left opencode,
-`oc` and the Agent tab with no provider for the box's own model, "Provider not found: qwen38").
+`oc` and the Agent view with no provider for the box's own model, "Provider not found: qwen38").
 A config you already have is kept: the installer merges the served lane's limits into it,
 and adds the provider of a lane installed since (the 27B first, the flash lane later) when
 it already has one of this repo's providers. When it has none of them, the installer says
@@ -17,7 +17,7 @@ so and leaves it alone: merge the `qwen38` (and/or `flashnext`) block from
 oc        # opencode on this box's model, with the output cap lifted (see below)
 ```
 
-`oc` and the cockpit's Agent tab also load that generated config through
+`oc` and the cockpit's Agent view also load that generated config through
 `OPENCODE_CONFIG`, which opencode reads over your global one: their default is the model
 this box serves even when your own config names another, and opencode can never fall back
 to its free hosted model there. That fallback is what a fresh box got before v1.18.4 (with
@@ -30,7 +30,7 @@ Four things this repo does were read out of one opencode binary and checked agai
 behaviour: the compaction threshold `oc-fit-limits.py` sizes the limits for, the hidden
 32,000-token output cap the `oc` launcher lifts, the overflow phrases the proxy answers
 with so that a refusal makes opencode compact instead of failing, and `--yolo` /
-`OPENCODE_PERMISSION` for the Agent tab. So `install.sh` pins the opencode it runs:
+`OPENCODE_PERMISSION` for the Agent view. So `install.sh` pins the opencode it runs:
 **1.18.32** (`OPENCODE_VERSION`, with the sha256 GitHub publishes for
 `opencode-linux-arm64.tar.gz` in `OPENCODE_SHA256`). It was checked against the 1.18.27
 the repo was measured on, on 2026-09-23: the same 21 overflow phrases and 3 exclusions
@@ -52,7 +52,7 @@ Left alone, opencode installs its own patch releases (read out of its binary: on
 `"autoupdate": false`, `"notify"` or a minor/major release stop it), which is how two boxes
 installed a week apart end up on two versions. With the pin, the generated config and
 yours get `"autoupdate": "notify"`: opencode still announces a release, and does not
-install it itself. A stricter `false` you set is kept. The Agent tab says when the
+install it itself. A stricter `false` you set is kept. The Agent view says when the
 opencode it serves is not the pinned one.
 
 `OPENCODE_PIN=0 ./install.sh` keeps whatever opencode you have and leaves `autoupdate`
@@ -73,6 +73,6 @@ What the shipped config gets right for you:
 4. **Mid-conversation system messages**: some agent clients inject system messages after turn 1; the stock template raises `System message must be at the beginning`. Patched to render them as `<system-reminder>` blocks.
 5. **Vision declared**: `attachment` + `modalities` are set, so image attachments and on-disk image reads work end to end (the model is natively multimodal).
 
-On service installs the generated config points at the **keepalive proxy port** (`PORT+1`), not the server directly, and that is deliberate: SGLang buffers tool-call arguments while they stream (127 s of measured silence on one 400-line file write, at native context), and opencode drops a stream after roughly 140-180 s without a real chunk. The proxy (`qwen38-keepalive.service`, vendored `keepalive-proxy.py`) fills those silences with protocol-correct keepalives, at SSE event boundaries only, and makes sure a client that gives up does not leave a generation running (v6.14: it names every request with `x-override-rid` so it can abort one that has not produced anything yet, aborts before closing the socket, and drains the answer where the engine offers no rid to abort with). With `./install.sh --no-service` there is no proxy: the config then points at the server directly, and huge single-file writes may abort. One more caveat, measured: SGLang's `--api-key` only accepts `Authorization: Bearer`, **not** `x-api-key`.
+On service installs the generated config points at the **keepalive proxy port** (`PORT+1`), not the server directly, and that is deliberate: SGLang buffers tool-call arguments while they stream (127 s of measured silence on one 400-line file write, at native context), and opencode drops a stream after roughly 140-180 s without a real chunk. The proxy (`qwen38-keepalive.service`, vendored `keepalive-proxy.py`) fills those silences with protocol-correct keepalives, at SSE event boundaries only, and makes sure a client that gives up does not leave a generation running (v6.14: it names every request with `x-override-rid` so it can abort one that has not produced anything yet, aborts before closing the socket, and drains the answer where the engine offers no rid to abort with). Since v1.22.5 (proxy v6.31) it also keeps a stream the engine has not started: SGLang sends a stream's headers with its first chunk, after the queue and the prefill, and opencode 1.18.32 gives up on a response whose headers have not come in 300 s (`headerTimeout`, its default) and sends the request again, while the engine keeps the one it gave up on queued. The proxy opens such a stream itself after 10 s and keeps it alive until the engine answers, and a caller that leaves before then has its request ended in the engine. Several agents at once (opencode's sub-agents, or several sessions) share the lane's KV pool, and past it every turn computes its whole prompt again: keep the sum of their contexts under the pool ([flash-lane.md](flash-lane.md#several-agents-at-once-their-contexts-share-one-pool) has the measurements). With `./install.sh --no-service` there is no proxy: the config then points at the server directly, and huge single-file writes may abort. One more caveat, measured: SGLang's `--api-key` only accepts `Authorization: Bearer`, **not** `x-api-key`.
 
 [Back to the README](../README.md)

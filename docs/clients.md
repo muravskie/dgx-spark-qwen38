@@ -124,6 +124,17 @@ byte of it is read.
   default output (worst case 709,000), or `529000` with
   `CLAUDE_CODE_EXTRA_BODY='{"max_tokens":250000}'` (worst case 756,000).
 
+  Neither pair fits the flash lane, whose window is 262,144 tokens. With
+  `max_tokens` at 250,000 every request passed it (15,563 prompt tokens plus
+  250,000), the engine refused it inside its stream, and Claude Code (2.1.286)
+  sent it again without a stream, which it gave up on after about 6 minutes:
+  a long answer never came, and the proxy's hold during a restart could not
+  keep such a request alive (measured on the reference box, 2026-10-02);
+  `700000` lets a session grow past the window. On the flash lane: `205000`
+  with `CLAUDE_CODE_EXTRA_BODY='{"max_tokens":32000}'`, the limits opencode uses
+  there; a launcher can pick the pair by the lane that serves
+  (`systemctl is-active --quiet qwen38-flash.service`).
+
   The idle-timeout variables are the difference between "hangs" and "slow";
   they are named in issue #2 and in the failure family diagnosed in
   issue #1 (clients cap total turn duration, not idle time). Quality and
@@ -216,7 +227,9 @@ carries the engine key in clear), `/generate`, `/flush_cache` and
 `/abort_request` went through with no key at all, and so did a path escaped
 twice (`/%2576%2531/...`), which SGLang decodes once more before routing. Since
 v1.18.7 a path still escaped after one decode is refused, and `/server_info` is
-relayed without the engine's key fields in either mode. The label appears on
+relayed without the engine's key fields in either mode; since v1.22.6 (proxy v6.32)
+without the key's value anywhere else in it either, where SGLang's `launch_command`
+repeated it with the rest of the engine's command line. The label appears on
 every journal line of the request (`journalctl -u qwen38-keepalive`), the first
 one included since v1.18.7, as one word (a space or a control character in it is
 written `_`), so per-client throughput and refusals become readable without a

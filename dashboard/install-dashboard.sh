@@ -84,6 +84,9 @@ stale_since(){
 }
 
 TMP_UNIT="$(mktemp)"
+# removed however this ends: a die, or a failed install under set -e, between here and the rm
+# below left the rendered unit in /tmp, once for every test run that took such a path (2026-10-03)
+trap 'rm -f "$TMP_UNIT"' EXIT
 sed -e "s|__PORT__|$PORT|g" -e "s|__BIND__|$BIND|g" -e "s|__USER__|$(id -un)|g" \
     -e "s|__GROUP__|$(id -gn)|g" -e "s|__REPO_DIR__|$REPO_DIR|g" \
     -e "s|__HOME__|$HOME|g" \
@@ -96,6 +99,7 @@ cmp -s "$TMP_UNIT" "$INSTALLED" || { sudo install -m 644 "$TMP_UNIT" "$INSTALLED
 rm -f "$TMP_UNIT"
 
 TMP_SUDO="$(mktemp)"
+trap 'rm -f "$TMP_UNIT" "$TMP_SUDO"' EXIT
 # read-only forensics wrapper (scheduler stack dump), referenced by the sudoers line below
 sudo install -m 755 "$HERE/pyspy-scheduler.sh" /usr/local/bin/qwen38-pyspy-scheduler
 sed -e "s|__USER__|$(id -un)|g" -e "s|__HOME__|$HOME|g" "$HERE/sudoers-cockpit.template" > "$TMP_SUDO"
@@ -110,7 +114,10 @@ sudo systemctl enable --now "$UNIT"
 # otherwise: a restart drops every open page and the Agent tab's connection, and
 # a run that changed nothing did it twice, install.sh then install-agent.sh (36
 # cockpit starts on the reference box on 2026-09-23; found in review, 2026-09-24).
-if [ "$DASH_CHANGED" -eq 1 ] || stale_since "$UNIT" "$HERE"/*.py "$REPO_DIR/oc-fit-limits.py"; then
+# CHANGELOG.md is read at start too: the release the page names is its first heading,
+# and an update that changed only the page's static files and that file left the
+# cockpit naming the release before (v1.19.0 on a box updated to v1.20.0, 2026-10-01).
+if [ "$DASH_CHANGED" -eq 1 ] || stale_since "$UNIT" "$HERE"/*.py "$REPO_DIR/oc-fit-limits.py" "$REPO_DIR/CHANGELOG.md"; then
   sudo systemctl try-restart "$UNIT"
 fi
 for _ in $(seq 1 15); do

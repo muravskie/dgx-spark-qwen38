@@ -14,8 +14,8 @@ Run everything the way CI does:
 ./ci-local.sh Coverage              # one gate by name fragment
 ```
 
-The full run takes about twelve minutes, and three quarters of that is the
-mutation gate re-running a suite once per injected fault. While working, run the
+A full run took 18.5 minutes on the reference box in October 2026, and 33 while the box was
+busy with other work. While working, run the
 gate you care about by name fragment; run the whole thing before pushing.
 
 The runtime is **stdlib only** and stays that way. Three measuring gates need pip
@@ -26,16 +26,24 @@ interpreter that has them, and a developer sets that up once:
 python3 -m venv .venv-test && .venv-test/bin/pip install coverage hypothesis
 ```
 
-That venv is not enough on its own. `ci-local.sh` runs a step only when the tools
-it names are on `PATH` and reports it SKIPPED otherwise: it looks for
-`shellcheck`, `docker` and `gh` by name anywhere in the step's text (which also
-skips 13 steps that merely contain the letters `gh` when the GitHub CLI is
-missing), and it runs the six steps that pip-install their tooling on the runner
-(ruff, the fuzz suite, both coverage floors, the property checks, System One)
-only when `ruff` is on `PATH`, dropping their pip lines. So put `ruff`,
-`shellcheck` and `gh` on `PATH` too. A skipped gate checked nothing, and a run in
-which every step was skipped still exits 0: read the last line, and a complete
-run ends with `0 sautes` (`CI local: N ok, N echecs, N sautes`).
+That venv is found by `tests/testpy.sh`: `QWEN38_TEST_PYTHON` first, then the checkout's own
+`.venv-test` and `.venv`, then `~/.local/share/qwen38-testenv`, then `python3`. A fresh clone
+has no `.venv-test`, so run the gates there with `QWEN38_TEST_PYTHON=/path/to/.venv-test/bin/python
+./ci-local.sh`, or the four steps that need `coverage` or `hypothesis` (the fuzz suite, both
+coverage floors, the property checks) are reported SKIPPED, missing the package.
+
+`ci-local.sh` runs every step as GitHub does (`bash -e`), each under a HOME and a TMPDIR of its
+own, both removed when the step ends: a test that read the developer's real API key passed here
+and failed on the runner, and the suite's temporary directories used to stay in /tmp (761 of
+them on the reference box on 2026-10-03). The workflows' own scratch files (coverage reports,
+rendered units, pin-watch's report) go under `${TMPDIR:-/tmp}` too, and a step fails CI on a
+fixed path in /tmp in any workflow: on a runner, which sets no TMPDIR, that is /tmp as before. A
+step that calls `shellcheck`, `docker` or `gh` when the tool is not installed is reported
+SKIPPED (a stub records the call), and so is a step whose runner-only `pip install` line names a
+package this box cannot provide (`ruff` must be on `PATH`; the others are looked for through
+`tests/testpy.sh`). A skipped gate checked nothing, and a run in which every step was skipped
+still exits 0: read the last line, and a complete run ends with `0 sautes`
+(`CI local: N ok, N echecs, N sautes`).
 
 ## The layers
 
@@ -458,10 +466,14 @@ the hole, a conditional is both branches.
   systemctl, no real API key. That is a **checked property**, not an intention,
   because these tests are run on the machine that serves production: the CI step
   "The offline suite touches nothing outside itself" gives the suite a witness
-  `HOME`, hashes every file in it before and after, and compares the listening
-  sockets on both sides. It earned its place immediately by catching
-  `test_cockpit_code.py` writing `cockpit-secret` into the developer's own
-  `~/.config/qwen38`, because importing `cockpit.py` persists an HMAC secret (so
-  a service restart does not log every browser out) and that suite had not
-  redirected `COCKPIT_CONFIG_DIR`. `test_cockpit_collectors.py` adds the other
-  half by recording every argv its stub was asked for.
+  `HOME`, hashes every file in it before and after, and runs the suite under
+  `tests/suite_reaper.py`, a child subreaper: whatever the suite's processes
+  leave running, listening or not, is theirs to answer for, while an editor that
+  opens a port meanwhile is not (comparing every listener of the machine failed
+  twice on 2026-10-03 while VS Code opened and closed ports). It earned its
+  place immediately by catching `test_cockpit_code.py` writing `cockpit-secret`
+  into the developer's own `~/.config/qwen38`, because importing `cockpit.py`
+  persists an HMAC secret (so a service restart does not log every browser out)
+  and that suite had not redirected `COCKPIT_CONFIG_DIR`.
+  `test_cockpit_collectors.py` adds the other half by recording every argv its
+  stub was asked for.

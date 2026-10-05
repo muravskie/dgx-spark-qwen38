@@ -35,6 +35,11 @@ def _read(path):
         return ""
 
 
+# Scripts a unit runs that the engine never reads: the guard runs before it starts and is
+# no input to it (engine-preflight.sh), so a new guard never restarts a healthy engine.
+NOT_INPUTS = {"engine-preflight.sh"}
+
+
 def inputs(unit, config_dir, hf_cache, ckpts):
     """(files, image refs, container names) the engine of this unit reads at start."""
     config_dir = config_dir.rstrip("/")
@@ -42,13 +47,13 @@ def inputs(unit, config_dir, hf_cache, ckpts):
     texts = [_read(f) for f in files]
     cfg = re.escape(config_dir)
     for script in sorted(set(re.findall(cfg + r"/[A-Za-z0-9._-]+\.sh", "\n".join(texts)))):
-        if os.path.isfile(script):
+        if os.path.isfile(script) and os.path.basename(script) not in NOT_INPUTS:
             files.append(script)
             texts.append(_read(script))
     body = "\n".join(texts)
     for name in sorted(set(re.findall(r"(?:/out|" + cfg + r")/([A-Za-z0-9._-]+)", body))):
         path = f"{config_dir}/{name}"
-        if os.path.isfile(path) and path not in files:
+        if os.path.isfile(path) and path not in files and name not in NOT_INPUTS:
             files.append(path)
     for ck in ckpts:
         repo, _, rev = ck.partition("@")
@@ -111,9 +116,15 @@ def running(unit, config_dir, hf_cache, ckpts):
     if not started.isdigit():
         return f"no: {name} has no start time"
     files, images, containers = inputs(unit, config_dir, hf_cache, ckpts)
+    # Whole seconds on both sides, as install.sh's stale_since compares them: systemd gives
+    # the start in whole seconds, and the installer writes the unit, then restarts the
+    # engine in the same second. Compared with the file's fraction, that write read as a
+    # change made after the start, and the run after every first install restarted an
+    # engine that had everything (the reference box, 2026-09-30: an 8-minute boot, and
+    # opencode-web restarted for the limits of the new pool).
     for f in files:
         try:
-            if os.stat(f).st_mtime > int(started):
+            if int(os.stat(f).st_mtime) > int(started):
                 return f"no: {f} changed after {name} started"
         except OSError:
             return f"no: {f} is unreadable"

@@ -5,12 +5,12 @@ Wants=network-online.target
 # wrapper someone can bypass: the image checkpoint is 31 GB of weights and peaks at
 # 34.8 GB during a 1024px request (measured), while the LLM lane holds its pool for the
 # life of the process. Starting this stops the LLM lane; starting an LLM lane stops this.
-Conflicts=qwen38-sglang.service qwen38-flash.service qwen38-llamacpp.service
+Conflicts=qwen38-sglang.service qwen38-flash.service qwen38-video.service qwen38-llamacpp.service
 # Conflicts= alone orders nothing: the old lane's stop and the new lane's start ran side
 # by side (5 to 60 s on the reference box, 2026-09-23). With the same units named in
 # After=, systemd finishes the stop before the start, in both directions (measured on
 # its systemd 255: 3.0 s of overlap without, 0.02 s after the stop with, 2026-09-24).
-After=network-online.target qwen38-sglang.service qwen38-flash.service qwen38-llamacpp.service
+After=network-online.target qwen38-sglang.service qwen38-flash.service qwen38-video.service qwen38-llamacpp.service
 
 [Service]
 Type=simple
@@ -20,6 +20,9 @@ WorkingDirectory=__IMAGE_LANE_DIR__
 Environment=HF_HOME=__HF_CACHE__
 Environment=HF_HUB_OFFLINE=1
 Environment=PYTHONUNBUFFERED=1
+# The memory the last engine held has to be back before this one starts: a start piled on
+# memory the driver kept is how sglang#40948 froze a DGX Spark (see engine-preflight.sh).
+ExecStartPre=/bin/bash __HOME__/.config/qwen38/engine-preflight.sh qwen38-image.service
 # The cookbook's DGX Spark recipe, and nothing else: one GPU, every component resident,
 # the runtime picking its own attention (it logs "Defaulting to Torch SDPA backend on
 # SM12.x"), full-image VAE decode, eager execution, batch 1. Forcing any of those is how

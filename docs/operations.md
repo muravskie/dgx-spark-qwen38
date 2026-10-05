@@ -6,6 +6,9 @@ Day-to-day commands, the opt-in extras, and what an upgrade from an earlier vers
 
 The command list is in the README, under "Operations". What follows is what does not fit there.
 
+What the box does when an engine dies or restarts (the start guard, requests held through
+the boot, a server left without its scheduler) is in [engine-restarts.md](engine-restarts.md).
+
 **Killing an abandoned generation.** If a client dies mid-generation the server keeps
 decoding for nothing (symptom: power draw and GPU busy with no active session). Behind
 the keepalive proxy this heals itself: the proxy aborts the upstream the moment the
@@ -33,7 +36,7 @@ Notes: the server's own `watchdog_timeout=300` is a *hang* detector (kills a gen
 
 **Idle power**: without `--sleep-on-idle`, SGLang's scheduler busy-spins a full CPU core while doing nothing (reported as +10-12 W at the wall by [alef204 and emX0r](https://forums.developer.nvidia.com/t/380257/56), diagnosed in [MiaAI-Lab issue #4](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark/issues/4)). Every serving lane ships the flag, and a CI gate requires it: the 27B units and `run.sh` since v1.2.6, the flash launcher since v1.8.5, where the lane was measured holding a core at 101 % for 12 h 21 min of idle because the launcher had been written without it. A/B on the reference box: scheduler CPU 101 % -> 1.7 % at idle, module power 12.1 -> 10.5 W, and wake-up TTFT unchanged (0.234-0.240 s before, 0.234-0.239 s after, measured after 60 s and 300 s of idle), throughput in family (41.5 tok/s code, 52.8 math).
 
-**Metrics**: every text lane passes `--enable-metrics` (the image lane exports
+**Metrics**: every text lane passes `--enable-metrics` (the image and video lanes export
 none), so Prometheus scrapes `/metrics` (request rates, KV usage, acceptance
 lengths under speculative decoding, queue depth). Since v1.17 the engine port is
 on loopback, so a scraper on another machine reads `http://<box>:30001/metrics`,
@@ -46,7 +49,7 @@ arrives at your next `./install.sh` re-run and engine start.
 
 ## Extras (opt-in)
 
-Three field-tested pieces from the reference box, deliberately not part of the default
+Four field-tested pieces from the reference box, deliberately not part of the default
 install because they touch things beyond the serving stack:
 
 **`extras/opencode/auto-continue.js`**: an opencode plugin that automatically resumes a
@@ -88,11 +91,33 @@ Boot-persistent (`cake-ingress.service`). Verify with a `ping 1.1.1.1` kept runn
 during a big download. The full bandwidth sweep and the reasoning are in the script's
 header; setting BANDWIDTH too high is the one mistake that silently does nothing.
 
+**`extras/chromium-sandbox/`**: makes Chromium launchable at all on Ubuntu 24.04, which
+the Spark ships. Ubuntu restricts unprivileged user namespaces, Chromium's sandbox needs
+them, so every Playwright/Chromium tool (gstack `/browse` among them) dies at launch with
+`No usable sandbox!`. One persistent sysctl (`99-chromium-userns.conf`) is the whole fix;
+app-level `--no-sandbox` patches were tried on the reference box and are the wrong lever
+(they drop the sandbox per-page, and uncompiled source patches protect nothing). It
+loosens that AppArmor restriction for all unprivileged userns on the machine, so it is
+opt-in; `./setup.sh --uninstall` restores the stock value. Details and the honest
+trade-off in [extras/chromium-sandbox/README.md](../extras/chromium-sandbox/README.md).
+
+```bash
+extras/chromium-sandbox/setup.sh              # sudo; applies now, persists on reboot
+extras/chromium-sandbox/setup.sh --uninstall  # back to Ubuntu's stock restriction
+```
+
 ## Upgrading from an earlier version
 
 ```bash
 cd dgx-spark-qwen38 && git pull && ./install.sh
 ```
+
+**v1.19 -> v1.20 installs the lanes a box does not have yet**: since v1.20 a plain run installs
+every lane, so the first update of a box with one text lane brings the other one (the flash lane
+is 203 GB, the 27B 54), the image lane (40) and the video lane (about 150 of headroom), each
+proved once, the served lane stopped meanwhile and proved again after. To keep a box as it is,
+say so on that run and later runs remember it: `./install.sh --no-flash --no-image --no-video`
+(or `--no-27b` on a flash box). A lane already installed is updated and not proved again.
 
 Your choices survive the upgrade: the API key, the patched template, your own systemd drop-ins
 under `/etc/systemd/system/qwen38-sglang.service.d/`, the opencode on/off choice (v1.5.9), and (since v1.3) the installed target

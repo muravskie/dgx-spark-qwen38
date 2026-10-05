@@ -9,6 +9,7 @@
 #   ./switch-model.sh flash-nvda      # nvidia/Qwen3.8-Flash-Next-NVFP4, ModelOpt mixed precision
 #   ./switch-model.sh flash-uncensored # the abliterated build of the same tree
 #   ./switch-model.sh image           # Qwen/Qwen-Image-2.1 (SGLang Diffusion, own venv)
+#   ./switch-model.sh video           # MiniMaxAI/MiniMax-H3 (SGLang Diffusion, own venv)
 #
 # Within the 27B lane (stock, uncensored, fp8, uncensored-fp8) it does what it
 # always did:
@@ -33,6 +34,11 @@
 # rewrites --model-path, --revision and the KV cache line of the unit.
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# A controller handoff is persistent: never fall back to legacy service ownership.
+if [ "${1:-}" != "--help" ] && [ "${1:-}" != "-h" ] && [ -f "$REPO_DIR/controller-ownership.py" ]; then
+  python3 "$REPO_DIR/controller-ownership.py" || exit 1
+fi
+
 die() { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 _ENV_HF_CACHE="${HF_CACHE:-}"      # before the pins below give it install.sh's default
@@ -40,7 +46,7 @@ _ENV_HF_CACHE="${HF_CACHE:-}"      # before the pins below give it install.sh's 
 # 27B lane and restarting what follows it, where the usage was all anyone wanted (found
 # in review, 2026-09-24). MODEL_CHOICE= still names one, as install.sh takes it.
 CHOICE="${1:-${MODEL_CHOICE:-}}"
-case "$CHOICE" in stock|uncensored|fp8|uncensored-fp8|flash|flash-nvda|flash-uncensored|image) ;; *) printf 'usage: ./switch-model.sh <stock|uncensored|fp8|uncensored-fp8|flash|flash-nvda|flash-uncensored|image>\n' >&2; [ -z "$CHOICE" ] && exit 2; die "unknown target: $CHOICE" ;; esac
+case "$CHOICE" in stock|uncensored|fp8|uncensored-fp8|flash|flash-nvda|flash-uncensored|image|video) ;; *) printf 'usage: ./switch-model.sh <stock|uncensored|fp8|uncensored-fp8|flash|flash-nvda|flash-uncensored|image|video>\n' >&2; [ -z "$CHOICE" ] && exit 2; die "unknown target: $CHOICE" ;; esac
 
 
 PINS="$(grep -E '^(IMAGE|STOCK_REPO|STOCK_REV|UNC_REPO|UNC_REV|FP8_REPO|FP8_REV|UNCFP8_REPO|UNCFP8_REV|FLASH_REPO|FLASH_REV|FLASH_NVDA_REPO|FLASH_NVDA_REV|FLASH_UNC_REPO|FLASH_UNC_REV|FLASH_IMAGE|FLASH_SERVE_IMAGE|SERVE_IMAGE|MODEL_CHOICE|HF_CACHE|CONFIG_DIR)=' "$REPO_DIR/install.sh" || true)"
@@ -56,6 +62,28 @@ unset _v
 
 IMAGE_UNIT="/etc/systemd/system/qwen38-image.service"
 IMAGE_UNIT_NAME="qwen38-image.service"
+VIDEO_UNIT="/etc/systemd/system/qwen38-video.service"
+VIDEO_UNIT_NAME="qwen38-video.service"
+
+# Free GB under a path's filesystem, whole numbers, "" when df cannot answer. Every
+# branch's room check reads through this, so it lives before the branches run.
+dl_free_gb(){ local p="${1:-$HF_CACHE}"; while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+              { df -BG --output=avail "$p" 2>/dev/null || true; } | tail -1 | tr -dc '0-9'; }
+
+# qwen38-llamacpp.service is the fifth serving unit: no installer here enables it,
+# but every lane template lists it in Conflicts=, so a box where an operator enabled
+# it by hand would boot it beside the lane just switched to, one of the two boot
+# jobs quietly removed from the transaction (found in the branch's reviews,
+# 2026-09-28). Disabling it keeps "exactly one serving unit enabled" true; a box
+# with an older sudoers file refuses that one line, and the switch must not die for
+# it, because the Conflicts= line already loses it the boot either way.
+disable_rollback_lane(){
+  if [ -f /etc/systemd/system/qwen38-llamacpp.service ] && systemctl is-enabled --quiet qwen38-llamacpp.service 2>/dev/null; then
+    echo "disabling qwen38-llamacpp.service at boot (unit file kept)"
+    sudo systemctl disable qwen38-llamacpp.service \
+      || echo "         (not disabled: this box's sudoers file predates the line; the boot conflict resolves against it anyway)"
+  fi
+}
 
 # ── The image lane: a third lane, switched to the same way as the other two ─────
 # Same contract as a cross-lane switch: verify the checkpoint, make it the one unit
@@ -68,7 +96,7 @@ IMAGE_UNIT_NAME="qwen38-image.service"
 # it is handled here, whole, and exits, instead of threading "unless image" through
 # four hundred lines written for SGLang's text server.
 if [ "$CHOICE" = "image" ]; then
-  [ -f "$IMAGE_UNIT" ] || die "the image lane is not installed on this box (no $IMAGE_UNIT). Install it once: ./install.sh --with-image (38 GB)"
+  [ -f "$IMAGE_UNIT" ] || die "the image lane is not installed on this box (no $IMAGE_UNIT). Install it once: ./install.sh --with-image (40 GB)"
   IMG_WD="$(grep -m1 -E '^WorkingDirectory=' "$IMAGE_UNIT" | cut -d= -f2- || true)"
   IMG_PY="${IMG_WD:-$HOME/.local/share/qwen38-image}/venv/bin/python"
   [ -x "$IMG_PY" ] || die "the image lane's runtime is missing ($IMG_PY): re-run ./install-image.sh, it resumes"
@@ -92,7 +120,7 @@ except Exception:
 PYIMG
   # Which text lane this box served, written down before it is disabled: install.sh
   # updates that lane on a later run, and enablement cannot tell it once both are off.
-  for TEXT_UNIT_NAME in qwen38-flash.service qwen38-sglang.service; do
+  for TEXT_UNIT_NAME in qwen38-flash.service qwen38-sglang.service qwen38-video.service; do
     if systemctl is-enabled --quiet "$TEXT_UNIT_NAME" 2>/dev/null; then
       printf '%s\n' "$TEXT_UNIT_NAME" > "$CONFIG_DIR/lane-before-image"
     fi
@@ -100,16 +128,17 @@ PYIMG
   # The loop variable ends in UNIT_NAME on purpose: CI checks every
   # `sudo systemctl <verb> "$..UNIT_NAME"` against the cockpit's sudoers allowlist,
   # and a variable called $u would have walked straight past it.
-  for TEXT_UNIT_NAME in qwen38-sglang.service qwen38-flash.service; do
+  for TEXT_UNIT_NAME in qwen38-sglang.service qwen38-flash.service qwen38-video.service; do
     if systemctl is-enabled --quiet "$TEXT_UNIT_NAME" 2>/dev/null; then
       echo "disabling $TEXT_UNIT_NAME at boot (unit file kept for switching back)"
       sudo systemctl disable "$TEXT_UNIT_NAME"
     fi
   done
+  disable_rollback_lane
   sudo systemctl enable "$IMAGE_UNIT_NAME" >/dev/null 2>&1 || sudo systemctl enable "$IMAGE_UNIT_NAME"
   sudo systemctl daemon-reload
   RUNNING=""
-  for u in qwen38-sglang.service qwen38-flash.service; do
+  for u in qwen38-sglang.service qwen38-flash.service qwen38-video.service qwen38-llamacpp.service; do
     systemctl is-active --quiet "$u" 2>/dev/null && RUNNING="$u"
   done
   printf '\n\033[1;32mSwitch queued: %s (%s)\033[0m\n' "$IMG_MODEL" "$IMAGE_UNIT_NAME"
@@ -120,6 +149,130 @@ PYIMG
   fi
   echo "The proxy on :30001 and opencode are text clients and were left as they are."
   echo "Switch back:      ./switch-model.sh stock   (or any text target)"
+  exit 0
+fi
+
+# ── The video lane: a fourth lane, switched to the same way as the image one ───
+# Same contract as the image lane: verify the checkpoint, make it the one unit
+# enabled at boot, never start or stop anything, print the exact commands. Like the
+# image lane it shares nothing with the text lanes: no serving image to inspect (it
+# runs from its own venv), no unit to rewrite (one checkpoint, one variant), no
+# prompt ceiling on the proxy (the proxy is a text door and nothing reaches this
+# lane through it), and no opencode default to move (opencode is a text client).
+# Handled here, whole, and exits.
+if [ "$CHOICE" = "video" ]; then
+  [ -f "$VIDEO_UNIT" ] || die "the video lane is not installed on this box (no $VIDEO_UNIT). Install it once: ./install.sh --with-video (about 150 GB of headroom)"
+  VID_WD="$(grep -m1 -E '^WorkingDirectory=' "$VIDEO_UNIT" | cut -d= -f2- || true)"
+  VID_PY="${VID_WD:-$HOME/.local/share/qwen38-video}/venv/bin/python"
+  [ -x "$VID_PY" ] || die "the video lane's runtime is missing ($VID_PY): re-run ./install-video.sh, it resumes"
+  VID_MODEL="$(grep -oE -- '--model-path [^ ]+' "$VIDEO_UNIT" | head -1 | cut -d' ' -f2 || true)"
+  VID_MODEL="${VID_MODEL:-MiniMaxAI/MiniMax-H3}"
+  VID_HF="$(grep -m1 -E '^Environment=HF_HOME=' "$VIDEO_UNIT" | cut -d= -f3- || true)"
+  printf '\n\033[1;36m── Verifying %s in the cache (resumable)\033[0m\n' "$VID_MODEL"
+  # Only the partition the installed unit serves is verified and fetched, by the same
+  # allowlist as install-video.sh: a complete fl2va cache answers without touching the
+  # network, and without it a switch re-downloaded the whole repo (Ref2VA included)
+  # onto a full disk (reference box, 2026-09-26).
+  VID_VARIANT="$(grep -oE -- '--model-variant [^ ]+' "$VIDEO_UNIT" | head -1 | cut -d' ' -f2 || true)"
+  VID_VARIANT="${VID_VARIANT:-fl2va}"
+  if [ "$VID_MODEL" = "MiniMaxAI/MiniMax-H3" ]; then
+    if [ "$VID_VARIANT" = "fl2va" ]; then VID_ALLOW="FL2VA/* model_index.json modular_model_index.json scheduler/* audio_scheduler/* *.md LICENSE*"
+    else VID_ALLOW="Ref2VA/* model_index.json modular_model_index.json scheduler/* audio_scheduler/* *.md LICENSE*"; fi
+  else VID_ALLOW="";
+  fi
+  # Xet stalls on this box, and an unauthenticated pull gets throttled.
+  # Fetch the revision this box actually serves, never the upstream main tip: the
+  # unit names the repo with HF_HUB_OFFLINE=1, so refs/main IS the served commit.
+  # A download without revision resolves main over the network, writes refs/main
+  # at the tip BEFORE the first byte is downloaded (huggingface_hub writes the ref
+  # before fetching: _snapshot_download.py), and resumes that half-fetched tip on
+  # the next boot attempt: a switched-off pin, ~145 GB of another commit, a dead
+  # offline unit. refs/main says what to fetch; the installer's pin answers when
+  # the ref is missing (a download by sha wrote no ref).
+  VID_MODEL_DIR="${VID_HF:-$HF_CACHE}/hub/models--${VID_MODEL//\//--}"
+  VID_REV=""
+  if [ -f "$VID_MODEL_DIR/refs/main" ]; then VID_REV="$(cat "$VID_MODEL_DIR/refs/main")"; fi
+  [[ "$VID_REV" =~ ^[0-9a-f]{40}$ ]] || VID_REV=""
+  if [ -z "$VID_REV" ]; then
+    if [ "$VID_MODEL" = "MiniMaxAI/MiniMax-H3" ]; then
+      VID_REV="$(grep -m1 -oE '^VIDEO_MODEL_PIN_REV="[0-9a-f]{40}"' "$REPO_DIR/install-video.sh" | cut -d'"' -f2 || true)"
+    else VID_REV="main"; fi
+  fi
+  [ -n "$VID_REV" ] || die "no refs/main under $VID_MODEL_DIR and install-video.sh no longer defines its pin: re-run ./install-video.sh, it resumes"
+  # Room first, the law the text branch learned on 2026-09-24 and this branch
+  # skipped: the cockpit's Load journey runs this under a serving engine, and a
+  # 145 GB weights fetch onto a fuller disk is a failure of everything on it
+  # (found in the branch's reviews, 2026-09-28). What the cache already holds
+  # comes off the need, so a complete cache (this box's normal state) needs only
+  # the floor and downloads nothing; the number is install-video.sh's own.
+  VID_WANT_GB="$(grep -m1 -oE '^WEIGHTS_GB=[0-9]+' "$REPO_DIR/install-video.sh" | cut -d= -f2 || true)"
+  VID_WANT_GB="${VID_WANT_GB:-145}"
+  VID_HAVE_B="$({ du -s --apparent-size -B1 "$VID_MODEL_DIR/blobs" 2>/dev/null || true; } | cut -f1)"
+  VID_WANT_GB=$((VID_WANT_GB - ${VID_HAVE_B:-0} / 1073741824)); [ "$VID_WANT_GB" -ge 10 ] || VID_WANT_GB=10
+  VID_FREE_GB="$(dl_free_gb "${VID_HF:-$HF_CACHE}")"
+  [ "${VID_FREE_GB:-0}" -ge "$VID_WANT_GB" ] \
+    || die "not enough room for $VID_MODEL under HF_HOME=${VID_HF:-$HF_CACHE}: ${VID_FREE_GB:-?} GB free, about $VID_WANT_GB GB needed (nothing was changed). Free some space first, or point HF_HOME at a bigger disk."
+  HF_HOME="${VID_HF:-$HF_CACHE}" HF_HUB_DOWNLOAD_TIMEOUT=30 HF_HUB_DISABLE_XET=1 VID_MODEL="$VID_MODEL" VID_ALLOW="$VID_ALLOW" VID_REV="$VID_REV" \
+    "$VID_PY" - <<'PYVID' || die "the video checkpoint could not be verified or fetched (re-run to resume; set HF_TOKEN if it stalls; if the pinned revision was removed upstream, ./install-video.sh VIDEO_MODEL_REV=main re-pins it)"
+import os
+import re
+from huggingface_hub import snapshot_download
+repo = os.environ["VID_MODEL"]
+rev = os.environ["VID_REV"]
+allow = [p for p in os.environ["VID_ALLOW"].split() if p] or None
+try:
+    # local_files_only first, so a complete cache answers without touching the
+    # network at all; a full sha resolves straight from snapshots/, refs or no refs.
+    path = snapshot_download(repo, revision=rev, local_files_only=True, allow_patterns=allow)
+except Exception:
+    print("not complete in the cache, fetching the rest", flush=True)
+    path = snapshot_download(repo, revision=rev, allow_patterns=allow)
+print(path)
+# refs/main is what the offline unit resolves, and a download by sha never writes
+# it: create it when missing, repair it when it holds no commit hash (a corrupt ref
+# strands the unit offline whatever just succeeded here), never move a valid one
+# the installer or the pin watch will answer for. This runs on the local-cache
+# success too: that is the common path, and the ref can be exactly as absent there.
+if len(rev) == 40:
+    ref = os.path.join(os.path.dirname(os.path.dirname(path.rstrip("/"))), "refs", "main")
+    cur = open(ref).read().strip() if os.path.exists(ref) else ""
+    if cur != rev and not re.fullmatch(r"[0-9a-f]{40}", cur):
+        os.makedirs(os.path.dirname(ref), exist_ok=True)
+        with open(ref, "w") as f:
+            f.write(rev)
+        print(f"   refs/main -> {rev[:12]}", flush=True)
+PYVID
+  # Which lane this box served, written down before it is disabled: install.sh
+  # updates that lane on a later run, and enablement cannot tell it once all are off.
+  for OTHER_UNIT_NAME in qwen38-flash.service qwen38-sglang.service qwen38-image.service; do
+    if systemctl is-enabled --quiet "$OTHER_UNIT_NAME" 2>/dev/null; then
+      printf '%s\n' "$OTHER_UNIT_NAME" > "$CONFIG_DIR/lane-before-video"
+    fi
+  done
+  # The loop variable ends in UNIT_NAME on purpose: CI checks every
+  # `sudo systemctl <verb> "$..UNIT_NAME"` against the cockpit's sudoers allowlist,
+  # and a variable called $u would have walked straight past it.
+  for OTHER_UNIT_NAME in qwen38-sglang.service qwen38-flash.service qwen38-image.service; do
+    if systemctl is-enabled --quiet "$OTHER_UNIT_NAME" 2>/dev/null; then
+      echo "disabling $OTHER_UNIT_NAME at boot (unit file kept for switching back)"
+      sudo systemctl disable "$OTHER_UNIT_NAME"
+    fi
+  done
+  disable_rollback_lane
+  sudo systemctl enable "$VIDEO_UNIT_NAME" >/dev/null 2>&1 || sudo systemctl enable "$VIDEO_UNIT_NAME"
+  sudo systemctl daemon-reload
+  RUNNING=""
+  for u in qwen38-sglang.service qwen38-flash.service qwen38-image.service qwen38-llamacpp.service; do
+    systemctl is-active --quiet "$u" 2>/dev/null && RUNNING="$u"
+  done
+  printf '\n\033[1;32mSwitch queued: %s (%s)\033[0m\n' "$VID_MODEL" "$VIDEO_UNIT_NAME"
+  if [ -n "$RUNNING" ]; then
+    echo "Effective after:  sudo systemctl stop $RUNNING && sudo systemctl start $VIDEO_UNIT_NAME   (or next reboot)"
+  else
+    echo "Effective after:  sudo systemctl start $VIDEO_UNIT_NAME   (or next reboot; ready in about 12 min)"
+  fi
+  echo "The proxy on :30001 and opencode are text clients and were left as they are."
+  echo "Switch back:      ./switch-model.sh stock   (or any text target, or image)"
   exit 0
 fi
 
@@ -268,8 +421,6 @@ printf '\n\033[1;36m── Verifying/downloading %s @ %s (resumable)\033[0m\n' "
 # for the target comes off the lane's need (install.sh's numbers: 45 GB for a 27B
 # checkpoint and its caches, 180 for flash).
 DL_REPO_CACHE="$HF_CACHE/hub/models--${TARGET_REPO//\//--}"
-dl_free_gb(){ local p="$HF_CACHE"; while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
-              { df -BG --output=avail "$p" 2>/dev/null || true; } | tail -1 | tr -dc '0-9'; }
 DL_NEED_GB=45; [ "$TARGET_LANE" = "flash" ] && DL_NEED_GB=180
 DL_HAVE_B="$({ du -s --apparent-size -B1 "$DL_REPO_CACHE/blobs" 2>/dev/null || true; } | cut -f1)"
 DL_NEED_GB=$((DL_NEED_GB - ${DL_HAVE_B:-0} / 1073741824)); [ "$DL_NEED_GB" -ge 10 ] || DL_NEED_GB=10
@@ -453,12 +604,18 @@ if [ -f "$OTHER_UNIT" ] && systemctl is-enabled --quiet "$OTHER_UNIT_NAME" 2>/de
   echo "disabling $OTHER_UNIT_NAME at boot (unit file kept for switching back)"
   sudo systemctl disable "$OTHER_UNIT_NAME"
 fi
-# The image lane is the third serving unit. Leaving it enabled while a text lane
-# is made the boot lane would bring two engines up at the next reboot.
+# The image lane is the third serving unit, the video lane the fourth. Leaving either
+# enabled while a text lane is made the boot lane would bring two engines up at the
+# next reboot.
 if [ -f "$IMAGE_UNIT" ] && systemctl is-enabled --quiet "$IMAGE_UNIT_NAME" 2>/dev/null; then
   echo "disabling $IMAGE_UNIT_NAME at boot (unit file kept for switching back)"
   sudo systemctl disable "$IMAGE_UNIT_NAME"
 fi
+if [ -f "$VIDEO_UNIT" ] && systemctl is-enabled --quiet "$VIDEO_UNIT_NAME" 2>/dev/null; then
+  echo "disabling $VIDEO_UNIT_NAME at boot (unit file kept for switching back)"
+  sudo systemctl disable "$VIDEO_UNIT_NAME"
+fi
+disable_rollback_lane
 sudo systemctl enable "$TARGET_UNIT_NAME" >/dev/null 2>&1 || sudo systemctl enable "$TARGET_UNIT_NAME"
 sudo systemctl daemon-reload
 # 4b) the keepalive proxy's one-prompt ceiling follows the lane (v1.5.6 contract, see
@@ -504,8 +661,10 @@ else
 # the invocation this switch just wrote, which is what the box will serve.
 # The label is read but not used here: the picker name is set by the python
 # block below, from the same table's LABEL dict, so it is read into a throwaway.
-# what the opencode server reads, before this switch writes any of it (see 4d)
-oc_configs_sum(){ cat "$CONFIG_DIR/opencode.json" "$HOME/.config/opencode/opencode.json" 2>/dev/null | sha256sum; }
+# what the opencode server reads, before this switch writes any of it (see 4d); a missing
+# file is part of the answer, not a failure (install.sh's first installs died on the same
+# line under pipefail)
+oc_configs_sum(){ { cat "$CONFIG_DIR/opencode.json" "$HOME/.config/opencode/opencode.json" 2>/dev/null || true; } | sha256sum; }
 SW_OC_SUM_BEFORE="$(oc_configs_sum)"
 if read -r SW_CTX SW_OUT _SW_LABEL \
      <<<"$("$REPO_DIR/oc-limits.sh" "$CHOICE" --from "$INVOCATION")" \
@@ -561,16 +720,31 @@ if systemctl list-unit-files opencode-web.service >/dev/null 2>&1 \
   if [ "$(oc_configs_sum)" != "$SW_OC_SUM_BEFORE" ]; then
     sudo systemctl restart opencode-web.service \
       && echo "opencode-web.service restarted so it reads the new limits" \
-      || echo "NOTE: could not restart opencode-web.service; restart it by hand or the Agent tab keeps the old limits"
+      || echo "NOTE: could not restart opencode-web.service; restart it by hand or the Agent view keeps the old limits"
   else
     echo "opencode-web.service kept: the limits it reads did not change"
   fi
 fi
 fi
 
+# 4f) pi and omp (docs/pi.md): the same dynamic the block above gives opencode.
+#     Their configs carry no second table of names and limits: pi-gen.py
+#     regenerates them from the opencode.json this switch just rewrote, as
+#     artifacts under ~/.config/qwen38 (pi/ JSON, omp/ YAML converted from it).
+#     No agent directory is ever written: the agents' own files are the user's
+#     copies, so re-copy them after a switch to pick up the new lane. Only on a
+#     box that asked for them once (./pi-gen.py made the directories): a switch
+#     writes no file for an agent nobody uses.
+if [ -d "$CONFIG_DIR/pi" ] || [ -d "$CONFIG_DIR/omp" ]; then
+  python3 "$REPO_DIR/pi-gen.py" --config "$CONFIG_DIR/opencode.json" --out "$CONFIG_DIR" \
+    || echo "NOTE: could not regenerate the pi/omp artifacts; run ./pi-gen.py by hand"
+fi
+
 RUNNING=""
 systemctl is-active --quiet "$OTHER_UNIT_NAME" 2>/dev/null && RUNNING="$OTHER_UNIT_NAME"
 systemctl is-active --quiet "$IMAGE_UNIT_NAME" 2>/dev/null && RUNNING="$IMAGE_UNIT_NAME"
+systemctl is-active --quiet "$VIDEO_UNIT_NAME" 2>/dev/null && RUNNING="$VIDEO_UNIT_NAME"
+systemctl is-active --quiet qwen38-llamacpp.service 2>/dev/null && RUNNING="qwen38-llamacpp.service"
 printf '\n\033[1;32mSwitch queued: %s (%s)\033[0m\n' "$TARGET_REPO" "$TARGET_UNIT_NAME"
 if [ -n "$RUNNING" ]; then
   echo "Effective after:  sudo systemctl stop $RUNNING && sudo systemctl start $TARGET_UNIT_NAME   (or next reboot)"
@@ -587,7 +761,7 @@ fi
 echo "Then fit them:    python3 oc-fit-limits.py   (the limits above are this target's"
 echo "                  nominal pair; the pool is only known once the engine is up)"
 case "$CHOICE" in
-  stock)      echo "Switch back:      ./switch-model.sh uncensored   (or fp8, flash, image)" ;;
+  stock)      echo "Switch back:      ./switch-model.sh uncensored   (or fp8, flash, image, video)" ;;
   uncensored) echo "Switch back:      ./switch-model.sh stock   (or fp8, flash)" ;;
   fp8)        echo "Switch back:      ./switch-model.sh stock   (or uncensored, uncensored-fp8, flash)" ;;
   uncensored-fp8) echo "Switch back:      ./switch-model.sh fp8   (or stock, uncensored, flash)" ;;

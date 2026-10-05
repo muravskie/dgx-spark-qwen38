@@ -1,6 +1,6 @@
 // Phone-layout check of the cockpit: a headless Chromium emulates real iPhone
 // viewports (device metrics, touch, the device pixel ratio) and measures what a
-// phone actually gets on every tab. It reports, per device and per tab:
+// phone actually gets on every view. It reports, per device and per tab:
 //
 //   * horizontal overflow of the document (the phone tell: the page slides sideways)
 //   * every element wider than the viewport that is NOT inside a scroller of its
@@ -38,7 +38,7 @@ const DEVICES = [
   { name: 'iPhone 15 Pro Max (430x932)', w: 430, h: 932, dpr: 3 },
   { name: 'iPhone 15 landscape (852x393)', w: 852, h: 393, dpr: 3 },
 ];
-const TABS = ['overview', 'agent', 'engines', 'requests', 'machine', 'models', 'systemone', 'image', 'video', 'logs', 'setup'];
+const VIEWS = ['now', 'lanes', 'traffic', 'machine', 'agent', 'decide', 'image', 'video', 'library', 'logs', 'settings'];
 
 const key = readFileSync(KEYFILE, 'utf8').trim();
 const login = await fetch(`${BASE}/api/login`, {
@@ -75,6 +75,16 @@ async function evalJs(expression) {
   if (r.result?.exceptionDetails) throw new Error(r.result.exceptionDetails.exception?.description || 'eval threw');
   return r.result?.result?.value;
 }
+
+// A finger: a touch at the centre of an element brought on screen first.
+const tapXY = async (x, y) => {
+  await send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, radiusX: 3, radiusY: 3, force: 1 }] }, sessionId);
+  await sleep(40);
+  await send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] }, sessionId);
+};
+const aim = sel => evalJs(`(() => { const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return null;
+  e.scrollIntoView({block: 'center'}); const r = e.getBoundingClientRect(); if (!r.width || !r.height) return null;
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
 
 // The audit runs in the page: one pass over the DOM per tab.
 const AUDIT = `(() => {
@@ -127,7 +137,7 @@ const AUDIT = `(() => {
   const frame = document.querySelector('.agentframe');
   const fr = frame ? frame.getBoundingClientRect() : null;
   const agentmax = document.body.classList.contains('agentmax');
-  const agentnote = !document.getElementById('agnote')?.hidden;
+  const agentnote = !document.getElementById('ag-note')?.hidden;
   return JSON.stringify({
     vw, vh,
     docScrollW: document.documentElement.scrollWidth,
@@ -147,11 +157,26 @@ for (const d of DEVICES) {
     width: d.w, height: d.h, deviceScaleFactor: d.dpr, mobile: true,
   }, sessionId);
   await send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 5 }, sessionId);
-  await send('Page.navigate', { url: BASE + '/#overview' }, sessionId);
+  await send('Page.navigate', { url: BASE + '/#now' }, sessionId);
   await sleep(4500);
-  for (const tab of TABS) {
-    await evalJs(`(() => { const b = document.querySelector('.rail .nav[data-tab="${tab}"]'); if (b) b.click(); else location.hash = '#${tab}'; })()`);
+  // each device starts from the phone's default (fullscreen), not from a choice a previous
+  // device's exit tap stored in this origin
+  await evalJs("(() => { try { localStorage.removeItem('cockpit.agent.max'); } catch {} agentMaxChoice = null; return 1; })()");
+  for (const tab of VIEWS) {
+    // Switch the way a thumb does: out of the Agent's fullscreen, the menu button, then the
+    // item. element.click() from script ignores what covers the item, and the drawer's own
+    // veil covered every one of them while this check stayed green (2026-09-30).
+    if (await evalJs("document.body.classList.contains('agentmax')")) {
+      const ex = await aim('#ag-exit'); if (ex) { await tapXY(ex.x, ex.y); await sleep(400); }
+    }
+    if (await evalJs("getComputedStyle(document.getElementById('menubtn')).display !== 'none'")) {
+      const m = await aim('#menubtn'); if (m) { await tapXY(m.x, m.y); await sleep(450); }
+    }
+    const it = await aim(`.rail .nav[data-view="${tab}"]`);
+    if (it) await tapXY(it.x, it.y);
     await sleep(tab === 'agent' ? 2500 : 700);
+    ok(`${d.name} ${tab}: a tap on the ${tab} item shows it`, it && await evalJs(`document.body.dataset.view === '${tab}'`),
+      it ? await evalJs('document.body.dataset.view') : 'the item is not rendered');
     const a = JSON.parse(await evalJs(AUDIT));
     report.push({ device: d.name, tab, ...a });
     ok(`${d.name} ${tab}: no horizontal overflow`, a.overflowX <= 1, `document scrolls ${a.overflowX}px past ${a.vw}px`);
@@ -183,6 +208,25 @@ for (const d of DEVICES) {
       }
     }
   }
+  // The inline frame, as a person who left fullscreen gets it on this phone: it was sized
+  // on a guess of 150 px above it, and its composer sat below the fold (2026-09-30).
+  await evalJs("(() => { if (document.body.classList.contains('agentmax')) setAgentMax(false, false); showView('now'); try { localStorage.setItem('cockpit.agent.max', '0'); } catch {} agentMaxChoice = null; return 1; })()");
+  await sleep(300);
+  if (await evalJs("getComputedStyle(document.getElementById('menubtn')).display !== 'none'")) {
+    const m = await aim('#menubtn'); if (m) { await tapXY(m.x, m.y); await sleep(450); }
+  }
+  const ai = await aim('.rail .nav[data-view="agent"]'); if (ai) await tapXY(ai.x, ai.y);
+  await sleep(2500);
+  const inl = JSON.parse(await evalJs(AUDIT));
+  if (!inl.agentnote && inl.frame && !inl.agentmax) {
+    ok(`${d.name} agent inline: the opencode frame fits the viewport`,
+      inl.frame.top >= 0 && inl.frame.bottom <= inl.vh + 2, JSON.stringify(inl.frame) + ` vh=${inl.vh}`);
+    ok(`${d.name} agent inline: the frame gets most of the screen`, inl.frame.h >= inl.vh * 0.55,
+      `${inl.frame.h}px of ${inl.vh}px`);
+  } else {
+    ok(`${d.name} agent inline: the frame is shown inline`, false, JSON.stringify({ note: inl.agentnote, frame: inl.frame, max: inl.agentmax }));
+  }
+  await evalJs("(() => { try { localStorage.removeItem('cockpit.agent.max'); } catch {} agentMaxChoice = null; return 1; })()");
 }
 
 try { ws.close(); } catch {}
@@ -192,5 +236,5 @@ const pass = checks.filter(c => c.ok).length;
 const fails = checks.filter(c => !c.ok);
 for (const c of checks) if (!c.ok) console.log(`  ECHEC ${c.name}\n        ${c.detail}`);
 if (process.env.MOBILE_VERBOSE === '1') console.log(JSON.stringify(report, null, 1));
-console.log(`\n${pass}/${checks.length} checks passed on ${DEVICES.length} iPhone viewports x ${TABS.length} tabs`);
+console.log(`\n${pass}/${checks.length} checks passed on ${DEVICES.length} iPhone viewports x ${VIEWS.length} views`);
 process.exit(fails.length ? 1 : 0);

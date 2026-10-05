@@ -1,5 +1,6 @@
 """Offline tests for lifecycle.py, built on REAL log lines from this box
 (qwen38-flash boot of 2026-08-28 21:19 and qwen38-sglang boots of 08-28)."""
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -96,7 +97,7 @@ class DeriveState(unittest.TestCase):
 
     def test_a_container_that_outlives_its_unit_is_an_orphan(self):
         """A stop past its timeout: systemd kills the docker client and marks the unit
-        failed (app.js already tells that case apart), while the container, which the
+        failed (base.js already tells that case apart), while the container, which the
         docker daemon owns, keeps its whole pool. Also a container started by hand. It
         read "failed" or "stopped", and neither was busy for the gate."""
         for active in ("failed", "inactive", "dead"):
@@ -439,6 +440,10 @@ class FeedOutcomes(unittest.TestCase):
         # v6.25: the caller of a non-streamed answer left while the engine worked; the
         # proxy ended the upstream and the engine dropped the request itself
         "CLIENT GONE during non-sse wait": "gone",
+        # v6.28: the caller left while its request waited for the engine to come back
+        "CLIENT GONE during hold": "gone",
+        # v6.29: the caller left before its body arrived whole, and the engine was not asked
+        "CLIENT GONE before its body": "gone",
         "no outcome (client vanished mid-request)": "gone",
         "DROPPED upstream silent": "fail",
         "UPSTREAM CUT": "fail",
@@ -465,6 +470,7 @@ class FeedOutcomes(unittest.TestCase):
         "422 systemone refused": "fail",
         "500 systemone failed": "fail",    # the catch-all: nothing leaves the route unanswered
         "CLIENT GONE mid-systemone": "gone",
+        "CLIENT GONE before the engine answered": "gone",   # v6.31: a stream's caller left while it was queued
         "502 systemone upstream": "fail",
         "529 systemone overloaded": "fail",   # admission: the caller past SYSTEMONE_MAX_CALLS got no answer
     }
@@ -568,14 +574,198 @@ class FeedOutcomes(unittest.TestCase):
         self.assertEqual((rows[0]["outcome"], rows[0]["kind"], rows[0]["peer"]), ("ok", "ok", "127.0.0.1:5555"))
         self.assertIn("28,458 tokens counted", rows[0]["detail"])
 
-    def test_an_unfinished_request_is_live_then_unknown(self):
-        start = ("2026-09-10T09:00:00+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 -> "
-                 "POST /v1/chat/completions body=42b")
-        self.assertEqual(lc.parse_feed(start)[0]["kind"], "live")
-        # 11 minutes of newer traffic later, it is not in flight, it is unaccounted for
-        later = start + ("\n2026-09-10T09:11:00+02:00 gx10 python3[1]: [proxy] 127.0.0.1:6666 -> "
-                         "POST /v1/chat/completions body=42b")
-        self.assertEqual(lc.parse_feed(later)[0]["kind"], "unknown")
+    START = ("2026-10-01T12:49:31+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 -> "
+             "POST /v1/chat/completions body=502315b")
+
+    def test_an_unfinished_request_stays_live_however_long_it_waits(self):
+        """A generation has no deadline. On 2026-10-01 eight long prompts went in at once:
+        three answered after 14 minutes, the last after 22, and the 10-minute rule this
+        replaced called the five still queued "no end logged" while the engine ran three
+        and queued two."""
+        self.assertEqual(lc.parse_feed(self.START)[0]["kind"], "live")
+        later = self.START + ("\n2026-10-01T13:03:29+02:00 gx10 python3[1]: [proxy] 127.0.0.1:6666 -> "
+                              "POST /v1/chat/completions body=42b"
+                              "\n2026-10-01T13:11:29+02:00 gx10 python3[1]: [proxy] 127.0.0.1:6666 POST "
+                              "/v1/chat/completions ok in 480.0s")
+        rows = lc.parse_feed(later)
+        self.assertEqual([(r["outcome"], r["kind"]) for r in rows],
+                         [("in flight", "live"), ("ok", "ok")])
+
+    def test_it_has_no_end_once_the_proxy_that_took_it_is_gone(self):
+        """Every way this box's journal says the proxy process is gone, copied from it: the
+        stop (both shapes of systemd's line), a crash, and the next proxy's banner (both
+        shapes, before and since PROXY_BIND)."""
+        for gone in ("systemd[1]: qwen38-keepalive.service: Deactivated successfully.",
+                     "systemd[1]: Stopped qwen38-keepalive.service - Keepalive proxy in front of the serving engine :30000 (agent clients connect to :30001).",
+                     "systemd[1]: Stopped Keepalive proxy in front of the serving engine :30000.",
+                     "systemd[1]: qwen38-keepalive.service: Main process exited, code=killed, status=9/KILL",
+                     "systemd[1]: qwen38-keepalive.service: Failed with result 'signal'.",
+                     "python3[2]: [proxy] v6.27 on 0.0.0.0:30001 -> http://127.0.0.1:30000 (keepalive 15s, max silence 900s)",
+                     "python3[2]: [proxy] v6.14 on :30001 -> http://127.0.0.1:30000"):
+            with self.subTest(gone=gone):
+                rows = lc.parse_feed(self.START + "\n2026-10-01T12:50:00+02:00 gx10 " + gone)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual((rows[0]["outcome"], rows[0]["kind"]), ("no end logged", "unknown"))
+                self.assertEqual(rows[0]["detail"], "the proxy that took it stopped")
+
+    def test_a_proxy_still_stopping_can_still_end_it(self):
+        """systemd writes "Stopping" before it signals the process: an end line can still
+        follow, and it must land."""
+        raw = "\n".join([self.START,
+                         "2026-10-01T12:50:00+02:00 gx10 systemd[1]: Stopping qwen38-keepalive.service - Keepalive proxy...",
+                         "2026-10-01T12:50:00+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 POST /v1/chat/completions "
+                         "CLIENT GONE on write in 29.0s"])
+        self.assertEqual(lc.parse_feed(raw)[0]["kind"], "gone")
+
+    def test_a_restart_leaves_finished_requests_alone_and_new_ones_live(self):
+        """Only what was still open when the proxy went is orphaned: a delivered answer keeps
+        its outcome, a request the next proxy took is live, and an end line with nothing
+        open on its peer is dropped instead of reviving the orphan."""
+        def line(ts, text):
+            return f"2026-10-01T12:{ts}+02:00 gx10 {text}"
+        raw = "\n".join([
+            line("49:00", "python3[1]: [proxy] 127.0.0.1:1111 -> POST /v1/chat/completions body=10b"),
+            line("49:05", "python3[1]: [proxy] 127.0.0.1:1111 POST /v1/chat/completions ok in 5.0s"),
+            self.START,
+            line("49:40", "python3[1]: [proxy] 127.0.0.1:5555 oversize check: 107156 tokens fit (436830 usable of pool 474816)"),
+            line("50:00", "systemd[1]: qwen38-keepalive.service: Deactivated successfully."),
+            line("50:01", "python3[2]: [proxy] v6.27 on 0.0.0.0:30001 -> http://127.0.0.1:30000"),
+            line("50:02", "python3[2]: [proxy] 127.0.0.1:5555 POST /v1/chat/completions ok in 31.0s"),
+            line("50:03", "python3[2]: [proxy] 127.0.0.1:7777 -> POST /v1/chat/completions body=10b"),
+        ])
+        rows = lc.parse_feed(raw)
+        self.assertEqual([(r["peer"], r["outcome"], r["kind"]) for r in rows],
+                         [("127.0.0.1:1111", "ok", "ok"),
+                          ("127.0.0.1:5555", "no end logged", "unknown"),
+                          ("127.0.0.1:7777", "in flight", "live")])
+        self.assertIsNone(rows[0]["detail"])
+        self.assertEqual(rows[1]["detail"], "107,156 tokens counted, fits (436,830 usable); the proxy that took it stopped")
+        self.assertIsNone(rows[1]["secs"])
+
+    def test_a_client_line_cannot_pass_for_the_proxy_going(self):
+        """Request lines carry a peer and a path, never the banner's place: the banner
+        alternative is anchored on the journal's "]: " so a peer, a label or a path that
+        read like one leaves the record alone."""
+        raw = "\n".join([self.START,
+                         "2026-10-01T12:50:00+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 key=v6.27_on_x "
+                         "oversize check: 10 tokens fit (100 usable of pool 200)",
+                         "2026-10-01T12:50:01+02:00 gx10 python3[1]: [proxy] 127.0.0.1:8888 -> GET "
+                         "/v1/Stopped body=0b"])
+        self.assertEqual(lc.parse_feed(raw)[0]["outcome"], "in flight")
+
+    def test_two_requests_sharing_a_peer_stay_two_requests(self):
+        """A reused keep-alive connection serves turns one after the other under
+        the same ip:port. The old single record per peer let the second start
+        overwrite the first, then let the first end mark the second as done:
+        the feed showed 6 in flight for 7 requests on the engine (found live,
+        2026-09-29, eight reviewers on one proxy)."""
+        def line(ts, text):
+            return f"2026-09-29T10:{ts}+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 {text}"
+        raw = "\n".join([
+            line("00:00", "-> POST /v1/chat/completions body=100b"),
+            line("00:01", "POST /v1/chat/completions ok in 1.0s"),
+            line("00:02", "-> POST /v1/chat/completions body=100b"),
+        ])
+        rows = lc.parse_feed(raw)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["outcome"], rows[0]["kind"]), ("ok", "ok"))
+        self.assertEqual((rows[1]["outcome"], rows[1]["kind"]), ("in flight", "live"))
+        # the first end must not touch the second request: end lines name the
+        # newest still-open record, and an end with nothing open is ignored
+        rows = lc.parse_feed(raw + "\n" + line("00:03", "POST /v1/chat/completions ok in 1.0s"))
+        self.assertEqual([(r["outcome"], r["kind"]) for r in rows],
+                         [("ok", "ok"), ("ok", "ok")])
+
+    def test_an_end_with_nothing_open_is_ignored(self):
+        """A duplicate end line (or one for a start the journal window lost)
+        must leave the completed record alone instead of rewriting it."""
+        def line(ts, text):
+            return f"2026-09-29T10:{ts}+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 {text}"
+        raw = "\n".join([
+            line("00:00", "-> POST /v1/chat/completions body=100b"),
+            line("00:01", "POST /v1/chat/completions ok in 1.0s"),
+            line("00:02", "POST /v1/chat/completions ok in 1.0s"),
+        ])
+        rows = lc.parse_feed(raw)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["outcome"], rows[0]["kind"], rows[0]["secs"]),
+                         ("ok", "ok", 1.0))
+
+    def test_an_end_naming_another_route_takes_the_open_one(self):
+        """Two requests multiplexed on one peer: the end line still closes the
+        newest still-open record when no open record has its route."""
+        def line(ts, text):
+            return f"2026-09-29T10:{ts}+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 {text}"
+        raw = "\n".join([
+            line("00:00", "-> POST /v1/chat/completions body=100b"),
+            line("00:01", "-> GET /v1/models body=0b"),
+            line("00:02", "POST /v1/other ok in 1.0s"),
+        ])
+        rows = lc.parse_feed(raw)
+        self.assertEqual([(r["path"], r["outcome"]) for r in rows],
+                         [("/v1/chat/completions", "in flight"),
+                          ("/v1/models", "ok")])
+
+    def test_an_end_closes_the_request_it_names_not_the_newest(self):
+        """Route matching is load-bearing, not decoration: swapping the method
+        and path groups, flipping == to !=, or turning either or into and must
+        all close the wrong record here (mutation walk, 2026-09-29)."""
+        def line(ts, text):
+            return f"2026-09-29T10:{ts}+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 {text}"
+        raw = "\n".join([
+            line("00:00", "-> POST /v1/a body=100b"),
+            line("00:01", "-> GET /v1/b body=100b"),
+            line("00:02", "POST /v1/a ok in 1.0s"),
+        ])
+        rows = lc.parse_feed(raw)
+        self.assertEqual([(r["path"], r["outcome"]) for r in rows],
+                         [("/v1/a", "ok"), ("/v1/b", "in flight")])
+
+    def test_feed_open_takes_the_route_parts_separately(self):
+        """_feed_open answers method-only and path-only calls from the parts
+        given: collapsing either or into and falls back to the newest record
+        instead (mutation walk, 2026-09-29). NOTE: `method is not None` flipped
+        to `is None` is genuinely equivalent and untestable: with both parts
+        missing the block and the fallback both answer the newest open record,
+        and parse_feed never calls it mixed any other way."""
+        a = {"outcome": "in flight", "method": "POST", "path": "/v1/a"}
+        b = {"outcome": "in flight", "method": "GET", "path": "/v1/b"}
+        recs = [a, b]
+        self.assertIs(lc._feed_open(recs, path="/v1/a"), a)
+        self.assertIs(lc._feed_open(recs, "POST"), a)
+        self.assertIs(lc._feed_open(recs), b)
+
+    def test_details_land_on_the_open_request_not_the_finished_one(self):
+        """A refused/fit line names only the peer: with an older request still
+        open beside a finished one, the detail belongs to the open one. `or`
+        turned into `and` would file it on the finished record."""
+        def line(ts, text):
+            return f"2026-09-29T10:{ts}+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 {text}"
+        raw = "\n".join([
+            line("00:00", "-> POST /v1/a body=100b"),
+            line("00:01", "-> POST /v1/b body=100b"),
+            line("00:02", "POST /v1/b ok in 1.0s"),
+            line("00:03", "REFUSED oversize (9b, 8 prompt tokens (counted by the engine), limit 7)"),
+            line("00:04", "oversize check: 6 tokens fit (7 usable of pool 9)"),
+        ])
+        rows = lc.parse_feed(raw)
+        self.assertIn("6 tokens counted", rows[0]["detail"])
+        self.assertIsNone(rows[1]["detail"])
+
+    def test_details_land_on_the_last_record_when_nothing_is_open(self):
+        """The `or [-1]` fallback is the only thing a late detail line has when
+        every record for the peer is finished: it attaches to the last one
+        instead of crashing."""
+        def line(ts, text):
+            return f"2026-09-29T10:{ts}+02:00 gx10 python3[1]: [proxy] 127.0.0.1:5555 {text}"
+        raw = "\n".join([
+            line("00:00", "-> POST /v1/a body=100b"),
+            line("00:01", "POST /v1/a ok in 1.0s"),
+            line("00:02", "oversize check: 6 tokens fit (7 usable of pool 9)"),
+        ])
+        rows = lc.parse_feed(raw)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("6 tokens counted", rows[0]["detail"])
 
 
 class MutantsThatSurvived(unittest.TestCase):
@@ -636,6 +826,18 @@ class MutantsThatSurvived(unittest.TestCase):
                                 {"qwen38-sglang.service": "ready"})
         self.assertEqual(len(warns), 1, warns)
         self.assertIn(":30001", warns[0])
+
+    def test_restarting_a_ready_lane_says_requests_wait_for_it(self):
+        """Since proxy v6.28 a request that reaches :30001 while a lane's unit comes back is
+        held for it: "will get errors" was true of a stop only."""
+        warns = lc.warn_reasons("unit", {"unit": "qwen38-sglang.service", "verb": "restart"},
+                                {"qwen38-sglang.service": "ready"})
+        self.assertEqual(len(warns), 1, warns)
+        self.assertIn("wait for it while it boots", warns[0])
+        self.assertNotIn("errors", warns[0])
+        stop = lc.warn_reasons("unit", {"unit": "qwen38-sglang.service", "verb": "stop"},
+                               {"qwen38-sglang.service": "ready"})
+        self.assertIn("will get errors", stop[0])
 
     def test_stopping_a_stopped_lane_warns_about_nothing(self):
         self.assertEqual(
@@ -845,35 +1047,21 @@ class MoreMutantsThatSurvived(unittest.TestCase):
         h = lc.record_pool(lc.record_pool({}, "u", "t", 1, keep=1), "u", "t", 2, keep=1)
         self.assertEqual(list(h.values())[0], [2])
 
-    # ---- parse_feed's timestamp and its 10-minute orphan window ------------
+    # ---- parse_feed's timestamp, and an orphan without a clock ---------------
     def test_only_an_iso_timestamp_is_read_as_one(self):
-        """Kills the And->Or of parse_feed's timestamp check: both the length and the
-        T position matter, or a line's own text becomes the clock."""
         raw = ("2026-09-10T09:00:00+02:00 h p[1]: [proxy] 1.2.3.4:5 -> "
                "POST /v1/chat/completions body=10b")
         self.assertEqual(lc.parse_feed(raw)[0]["ts"], "2026-09-10T09:00:00")
-        # A line with no timestamp at all must not become the clock: after it, a start
-        # left dangling 20 minutes before the newest dated line still reads as unknown.
-        # The check here read back the first character of a string the test wrote, and
-        # the mutant it claims passed (found in review, 2026-09-24).
-        raw = ("2026-09-10T09:00:00+02:00 h p[1]: [proxy] 1.2.3.4:5 -> POST /v1/chat/completions body=10b\n"
-               "2026-09-10T09:20:00+02:00 h p[1]: [proxy] 1.2.3.4:6 -> POST /v1/chat/completions body=10b\n"
-               "[proxy] 1.2.3.4:7 -> POST /v1/chat/completions body=10b\n")
-        first = lc.parse_feed(raw)[0]
-        self.assertEqual((first["peer"], first["outcome"], first["kind"]),
-                         ("1.2.3.4:5", "no end logged", "unknown"))
 
-    def test_an_orphan_becomes_unknown_only_after_ten_minutes(self):
-        """Kills line 386 Gt->GtE: at exactly 600 s it is still in flight."""
-        def feed(seconds):
-            start = ("2026-09-10T09:00:00+02:00 h p[1]: [proxy] 1.2.3.4:5 -> "
-                     "POST /v1/chat/completions body=10b")
-            mm, ss = divmod(seconds, 60)
-            later = (f"2026-09-10T09:{mm:02d}:{ss:02d}+02:00 h p[1]: [proxy] "
-                     "9.9.9.9:9 -> POST /v1/chat/completions body=10b")
-            return lc.parse_feed(start + "\n" + later)[0]
-        self.assertEqual(feed(600)["kind"], "live")
-        self.assertEqual(feed(601)["kind"], "unknown")
+    def test_neither_a_line_without_a_date_nor_hours_of_traffic_orphan_a_start(self):
+        """The clock this replaced read the newest dated line and turned every start 600 s
+        older into "no end logged". Nothing reads a clock now: an undated line, and twenty
+        hours of newer traffic, leave a start in flight; the proxy going is what ends it."""
+        raw = ("2026-09-10T09:00:00+02:00 h p[1]: [proxy] 1.2.3.4:5 -> POST /v1/chat/completions body=10b\n"
+               "2026-09-11T05:00:00+02:00 h p[1]: [proxy] 1.2.3.4:6 -> POST /v1/chat/completions body=10b\n"
+               "[proxy] 1.2.3.4:7 -> POST /v1/chat/completions body=10b\n")
+        self.assertEqual([(r["peer"], r["outcome"]) for r in lc.parse_feed(raw)],
+                         [("1.2.3.4:5", "in flight"), ("1.2.3.4:6", "in flight"), ("1.2.3.4:7", "in flight")])
 
 
 class TheLastTenLines(unittest.TestCase):
@@ -1303,12 +1491,16 @@ class ParseFeed(unittest.TestCase):
 class ParseFeedDangling(unittest.TestCase):
     L = "2026-08-30T0{h}:00:00+0200 host python3[1]: [proxy] {rest}"
 
-    def test_old_dangling_start_is_not_in_flight(self):
+    def test_old_dangling_start_is_in_flight_until_the_proxy_restarts(self):
         raw = "\n".join([
             self.L.format(h=1, rest="127.0.0.1:1111 -> POST /v1/chat/completions body=100b"),
             self.L.format(h=2, rest="127.0.0.1:2222 -> POST /v1/chat/completions body=200b"),
             self.L.format(h=2, rest="127.0.0.1:2222 POST /v1/chat/completions ok in 3.0s"),
         ])
+        by = {r["peer"]: r for r in lc.parse_feed(raw)}
+        self.assertEqual(by["127.0.0.1:1111"]["outcome"], "in flight")
+        self.assertEqual(by["127.0.0.1:2222"]["outcome"], "ok")
+        raw += "\n" + self.L.format(h=3, rest="v6.27 on 0.0.0.0:30001 -> http://127.0.0.1:30000")
         by = {r["peer"]: r for r in lc.parse_feed(raw)}
         self.assertEqual(by["127.0.0.1:1111"]["outcome"], "no end logged")
         self.assertEqual(by["127.0.0.1:2222"]["outcome"], "ok")
@@ -1321,6 +1513,76 @@ class ParseFeedDangling(unittest.TestCase):
         by = {r["peer"]: r for r in lc.parse_feed(raw)}
         self.assertEqual(by["127.0.0.1:3333"]["outcome"], "in flight")
 
+
+
+class AFeedKeepsEveryRequestInFlight(unittest.TestCase):
+    """The rail's badge and the table count the rows in flight, and the rows were the 25
+    newest requests: with eight agents, a generation that outlasted 25 newer requests (34
+    minutes on 2026-10-02) left both while the engine still ran it, the badge falling from
+    8 to 2. Older requests still in flight stay in the rows, and what was in flight at one
+    read is carried into the next, whose window no longer holds its start."""
+
+    L = "2026-10-02T23:{m:02d}:{s:02d}+02:00 gx10 python3[1]: [proxy] {rest}"
+
+    def short(self, n, minute):
+        out = []
+        for i in range(n):
+            port = 40000 + minute * 100 + i
+            out.append(self.L.format(m=minute, s=i % 60, rest=f"127.0.0.1:{port} -> POST /v1/chat/completions body=100b"))
+            out.append(self.L.format(m=minute, s=i % 60, rest=f"127.0.0.1:{port} POST /v1/chat/completions ok in 1.0s"))
+        return out
+
+    def long_start(self, port=49398, minute=16):
+        return self.L.format(m=minute, s=1, rest=f"127.0.0.1:{port} -> POST /v1/chat/completions body=111922b")
+
+    def test_an_older_request_in_flight_stays_in_the_rows(self):
+        raw = "\n".join([self.long_start()] + self.short(30, 20))
+        rows = lc.parse_feed(raw)
+        self.assertEqual(len(rows), 26)
+        self.assertEqual((rows[0]["peer"], rows[0]["outcome"]), ("127.0.0.1:49398", "in flight"))
+        self.assertEqual(sum(r["outcome"] == "in flight" for r in rows), 1)
+        self.assertEqual([r["outcome"] for r in rows[1:]], ["ok"] * 25)
+
+    def test_an_older_request_that_ended_leaves_the_rows_as_before(self):
+        end = self.L.format(m=21, s=59, rest="127.0.0.1:49398 POST /v1/chat/completions ok in 358.0s")
+        rows = lc.parse_feed("\n".join([self.long_start()] + self.short(30, 20) + [end]))
+        self.assertEqual(len(rows), 25)
+        self.assertNotIn("127.0.0.1:49398", [r["peer"] for r in rows[:-1]])
+
+    def test_a_request_carried_from_the_last_read_ends_in_this_one(self):
+        first = lc.parse_feed("\n".join([self.long_start()] + self.short(3, 20)))
+        carry = [r for r in first if r["outcome"] == "in flight"]
+        self.assertEqual(len(carry), 1)
+        later = self.short(3, 40) + [self.L.format(m=49, s=49, rest="127.0.0.1:49398 POST /v1/chat/completions ok in 2028.0s")]
+        rows = lc.parse_feed("\n".join(later), carry=carry)
+        by = {r["peer"]: r for r in rows}
+        self.assertEqual((by["127.0.0.1:49398"]["outcome"], by["127.0.0.1:49398"]["secs"]), ("ok", 2028.0))
+        self.assertNotIn("127.0.0.1:49398", {r["peer"] for r in lc.parse_feed("\n".join(later))},
+                         "without the carry, the end has no start to land on")
+
+    def test_a_carried_request_still_in_its_window_is_not_counted_twice(self):
+        raw = "\n".join([self.long_start()] + self.short(3, 20))
+        carry = [r for r in lc.parse_feed(raw) if r["outcome"] == "in flight"]
+        rows = lc.parse_feed(raw, carry=carry)
+        self.assertEqual(sum(r["peer"] == "127.0.0.1:49398" for r in rows), 1)
+
+    def test_a_carried_request_stays_in_flight_until_it_ends_or_the_proxy_goes(self):
+        carry = [r for r in lc.parse_feed(self.long_start()) if r["outcome"] == "in flight"]
+        rows = lc.parse_feed("\n".join(self.short(30, 40)), carry=carry)
+        self.assertEqual(sum(r["outcome"] == "in flight" for r in rows), 1)
+        gone = self.L.format(m=50, s=0, rest="v6.30 on 0.0.0.0:30001 -> http://127.0.0.1:30000")
+        rows = lc.parse_feed("\n".join(self.short(2, 41) + [gone]), carry=carry)
+        by = {r["peer"]: r for r in rows}
+        self.assertEqual(by["127.0.0.1:49398"]["outcome"], "no end logged")
+
+    def test_a_read_that_returned_nothing_keeps_what_was_in_flight(self):
+        carry = [r for r in lc.parse_feed(self.long_start()) if r["outcome"] == "in flight"]
+        self.assertEqual([r["peer"] for r in lc.parse_feed("", carry=carry)], ["127.0.0.1:49398"])
+
+    def test_the_carry_is_not_changed_by_the_read(self):
+        carry = [r for r in lc.parse_feed(self.long_start()) if r["outcome"] == "in flight"]
+        lc.parse_feed(self.L.format(m=49, s=49, rest="127.0.0.1:49398 POST /v1/chat/completions ok in 2028.0s"), carry=carry)
+        self.assertEqual(carry[0]["outcome"], "in flight")
 
 class OpencodeDefault(unittest.TestCase):
     def test_follows(self):
@@ -1407,6 +1669,381 @@ class PoolShortfall(unittest.TestCase):
         self.assertIn("190,000", msg)
         self.assertIn("restart", msg.lower())
 
+
+class FourEngines(unittest.TestCase):
+    """The video lane is a fourth engine, under the same one-at-a-time rule as the
+    other three: about 108 GB of weights do not fit beside any serving lane."""
+    VID = "qwen38-video.service"
+
+    def test_video_is_blocked_while_the_27b_serves(self):
+        r = lc.blocked_reasons("unit", {"unit": self.VID, "verb": "start"},
+                               {"qwen38-sglang.service": "ready", "qwen38-flash.service": "stopped",
+                                "qwen38-image.service": "stopped"})
+        self.assertEqual(len(r), 1)
+        self.assertIn("qwen38-sglang.service", r[0])
+
+    def test_video_is_blocked_while_the_image_lane_runs(self):
+        """With four lanes, checking one neighbour of three would let a start through."""
+        r = lc.blocked_reasons("unit", {"unit": self.VID, "verb": "start"},
+                               {"qwen38-sglang.service": "stopped",
+                                "qwen38-flash.service": "stopped",
+                                "qwen38-image.service": "ready"})
+        self.assertEqual(len(r), 1)
+        self.assertIn("qwen38-image.service", r[0])
+
+    def test_a_text_lane_is_blocked_while_the_video_lane_runs(self):
+        for text in ("qwen38-sglang.service", "qwen38-flash.service"):
+            with self.subTest(text=text):
+                r = lc.blocked_reasons("unit", {"unit": text, "verb": "start"},
+                                       {self.VID: "ready"})
+                self.assertEqual(len(r), 1)
+                self.assertIn(self.VID, r[0])
+
+    def test_an_image_start_is_blocked_while_the_video_lane_runs(self):
+        r = lc.blocked_reasons("unit", {"unit": "qwen38-image.service", "verb": "start"},
+                               {self.VID: "warming-up"})
+        self.assertEqual(len(r), 1)
+        self.assertIn(self.VID, r[0])
+
+    def test_video_starts_when_nothing_else_runs(self):
+        self.assertEqual(lc.blocked_reasons("unit", {"unit": self.VID, "verb": "start"},
+                                            {"qwen38-sglang.service": "stopped",
+                                             "qwen38-flash.service": "stopped",
+                                             "qwen38-image.service": "stopped"}), [])
+
+    def test_the_switch_waits_for_a_video_boot_too(self):
+        self.assertEqual(len(lc.blocked_reasons("switch", {"target": "stock"},
+                                                {self.VID: "loading-weights"})), 1)
+
+    def test_stopping_a_ready_video_lane_warns_about_the_video_not_the_proxy(self):
+        """The proxy on :30001 is a text door; nothing reaches this lane through it."""
+        w = lc.warn_reasons("unit", {"unit": self.VID, "verb": "stop"}, {self.VID: "ready"})
+        self.assertEqual(len(w), 1)
+        self.assertIn("video", w[0])
+        self.assertIn("12 min", w[0])
+        self.assertNotIn(":30001", w[0])
+
+    def test_the_video_lane_is_an_engine_but_not_a_text_engine(self):
+        self.assertIn(self.VID, lc.ENGINE_UNITS)
+        self.assertNotIn(self.VID, lc.TEXT_UNITS)
+        self.assertEqual(lc.VIDEO_UNIT, self.VID)
+
+
+class VideoBootLog(unittest.TestCase):
+    """The MiniMax-H3 boot lines, captured from journald on the reference box on
+    2026-09-25 (boot 23:08:50): DiT 61.73 GB in 13 shards, text encoder 48.09 GB,
+    audio VAE 0.56 GB, video VAE 5.2 GB, then three warmup requests before ready."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lines = (HERE.parent / "fixtures" / "video-boot.log").read_text().splitlines()
+
+    def at(self, needle):
+        """The boot as it looked the moment this line was written."""
+        for i, ln in enumerate(self.lines):
+            if needle in ln:
+                return lc.parse_video_boot_log(self.lines[:i + 1])
+        self.fail(f"the fixture has no line with {needle!r}")
+
+    def test_a_complete_boot_is_fired_up_with_every_stage_done(self):
+        b = lc.parse_video_boot_log(self.lines)
+        self.assertTrue(b["fired_up"])
+        self.assertEqual(b["done"], list(lc.VIDEO_STAGES))
+
+    def test_each_shared_milestone_opens_its_stage(self):
+        for needle, stage in (
+                ("Starting server", "init"),
+                ("Loading pipeline modules", "loading-weights"),
+                ("Pipeline instantiated", "loading-weights"),
+                ("Starting FastAPI server", "warming-up")):
+            with self.subTest(line=needle):
+                b = self.at(needle)
+                self.assertEqual(b["stage"], stage)
+                self.assertFalse(b["fired_up"])
+
+    def test_each_component_line_names_what_is_being_loaded(self):
+        """"loading weights" for a minute says less than "the 61.7 GB DiT"."""
+        for needle, detail in (
+                ("Loading text_encoder from", "48 GB text encoder"),
+                ("Loading MiniMaxH3DiTModel from", "61.7 GB DiT"),
+                ("Loading audio_vae from", "audio VAE"),
+                ("Loading video_vae from", "5.2 GB video VAE")):
+            with self.subTest(line=needle):
+                b = self.at(needle)
+                self.assertEqual(b["stage"], "loading-weights")
+                self.assertIn(detail, b["detail"])
+
+    def test_only_the_latest_boot_counts(self):
+        """journald keeps every previous life of the unit. A "fired up" from an earlier
+        boot must not make the one in progress read as ready."""
+        restarted = self.lines + ["[2026-09-25 22:00:00] Starting server...",
+                                  "[2026-09-25 22:00:07] Loading pipeline modules..."]
+        b = lc.parse_video_boot_log(restarted)
+        self.assertFalse(b["fired_up"])
+        self.assertEqual(b["stage"], "loading-weights")
+
+    def test_an_empty_journal_is_not_a_boot(self):
+        b = lc.parse_video_boot_log([])
+        self.assertIsNone(b["stage"])
+        self.assertFalse(b["fired_up"])
+
+
+
+
+class TheVideoRunComesFromItsOwnJournal(unittest.TestCase):
+    """The lane's own API says "queued, 0%" from the POST until the video is done
+    (measured 2026-09-29), so the phase and the step come from its journal. A wrong
+    operator here is a progress bar that lies while a 60 GB call burns the box."""
+
+    def run_of(self, *messages):
+        return lc.parse_video_run(list(messages))
+
+    def test_nothing_ran_reads_empty(self):
+        self.assertEqual(self.run_of(), {})
+        self.assertEqual(self.run_of("serving, some unrelated line"), {})
+
+    def test_a_step_line_alone_proves_a_request_runs(self):
+        r = self.run_of("denoise:  40%|#### | 20/50 [03:40<05:30, 11.02s/it]")
+        self.assertEqual(r["phase"], "denoise")
+        self.assertEqual((r["step"], r["steps"]), (20, 50))
+        self.assertEqual(r["elapsed_s"], 220.0)
+        self.assertEqual(r["left_s"], 330.0)
+        self.assertEqual(r["s_per_step"], 11.02)
+        self.assertEqual(r["label"], "denoising")
+
+    def test_a_h_m_s_clock_reads_and_a_question_mark_is_none(self):
+        r = self.run_of("denoise:  20%|# | 10/50 [1:02:03<??,  ?it/s]")
+        self.assertEqual(r["elapsed_s"], 3723.0)
+        self.assertIsNone(r["left_s"])
+        self.assertIsNone(r["s_per_step"])
+
+    def test_it_per_second_is_read_as_seconds_per_step(self):
+        r = self.run_of("denoise:  10%| | 5/50 [00:10<00:10, 1.52it/s]")
+        self.assertAlmostEqual(r["s_per_step"], 1 / 1.52, places=6)
+
+    def test_the_rate_helper_reads_both_arms_and_garbage(self):
+        self.assertEqual(lc._rate_s_per_step("14.78s/it"), 14.78)
+        self.assertEqual(lc._rate_s_per_step("2it/s"), 0.5)
+        for junk in ("?it/s", "0it/s", "x s/it", ""):
+            self.assertIsNone(lc._rate_s_per_step(junk), junk)
+
+    def test_a_zero_rate_reads_none_and_not_a_crash(self):
+        # 0it/s is tqdm's own before the first step completes: inverting it
+        # would crash the parser inside a live progress read
+        r = self.run_of("denoise:  0%| | 0/50 [00:00<?, 0it/s]")
+        self.assertIsNone(r["s_per_step"])
+        self.assertEqual(r["step"], 0)
+        self.assertEqual(r["steps"], 50)
+
+    def test_pipeline_start_is_encode_until_a_stage_names_otherwise(self):
+        r = self.run_of("Running pipeline stages for request abc")
+        self.assertEqual(r["phase"], "encode")
+        self.assertEqual(r["label"], "encoding the prompt")
+        r2 = self.run_of("Running pipeline stages", "[MiniMaxH3DenoisingStage] started")
+        self.assertEqual(r2["phase"], "denoise")
+
+    def test_a_stage_the_phase_map_does_not_know_leaves_encode(self):
+        r = self.run_of("Running pipeline stages", "[MiniMaxH3EncodingStage] started")
+        self.assertEqual(r["phase"], "encode")
+
+    def test_a_lone_finished_stage_is_not_a_run(self):
+        self.assertEqual(self.run_of("[MiniMaxH3DenoisingStage] finished"), {})
+
+    def test_a_finished_stage_moves_nothing_by_itself(self):
+        r = self.run_of("[MiniMaxH3DenoisingStage] finished", "[MiniMaxH3DecodingStage] started")
+        self.assertEqual(r["phase"], "decode")
+        self.assertEqual(r["label"], "decoding video and audio")
+
+    def test_denoise_stays_denoise_before_the_decode(self):
+        r = self.run_of("[MiniMaxH3DenoisingStage] started",
+                        "denoise:  60%|#### | 30/50 [05:30<03:40, 11.02s/it]")
+        self.assertEqual(r["phase"], "denoise")
+        self.assertEqual(r["step"], 30)
+
+    def test_the_100_percent_line_closes_the_denoise(self):
+        r = self.run_of("[MiniMaxH3DecodingStage] started",
+                        "denoise: 100%|####| 50/50 [09:52<00:00, 11.85s/it]")
+        self.assertEqual(r["phase"], "decode")
+        self.assertEqual(r["step"], 50)
+
+    def test_the_run_ends_at_its_outcome_line(self):
+        for end in ("Pixel data generated for request abc",
+                    "Error executing request abc",
+                    "Failed to generate video"):
+            r = self.run_of("Running pipeline stages", end)
+            self.assertEqual(r, {}, end)
+
+    def test_ansi_and_carriage_returns_do_not_hide_the_step(self):
+        r = self.run_of("\x1b[2B\x1b[1Gdenoise:  80%|#### | 40/50 [07:21<01:51, 11.12s/it]\r")
+        self.assertEqual(r["step"], 40)
+        self.assertEqual(r["s_per_step"], 11.12)
+
+
+class TheVideoRunFixtureIsReadEndToEnd(unittest.TestCase):
+    """One real 12-minute call, captured from journald on the reference box on
+    2026-09-29: 49 denoise steps at ~14.8 s each, then the pipeline's own "Pixel data
+    generated" line closes it. The tests above feed the parser hand-written lines;
+    this one feeds the whole journal, so a parser that reads them out of order or
+    loses the close is caught against what the lane really emitted."""
+
+    @classmethod
+    def setUpClass(cls):
+        raw = (HERE.parent / "fixtures" / "video-run.log").read_text().splitlines()
+        cls.msgs = [json.loads(ln) for ln in raw if ln.strip()]
+
+    def at(self, needle, last=False):
+        """The run as it looked the moment this line was written."""
+        idx = [i for i, m in enumerate(self.msgs) if needle in m]
+        self.assertTrue(idx, needle)
+        return lc.parse_video_run(self.msgs[:(idx[-1] if last else idx[0]) + 1])
+
+    def test_the_journal_opens_in_encode(self):
+        r = self.at("Running pipeline")
+        self.assertEqual(r["phase"], "encode")
+        self.assertIsNone(r["step"])
+
+    def test_the_first_step_line_switches_to_denoise(self):
+        r = self.at("denoise:")
+        self.assertEqual(r["phase"], "denoise")
+        self.assertEqual((r["step"], r["steps"]), (0, 49))
+
+    def test_the_last_step_line_carries_the_measured_rate(self):
+        r = self.at("denoise:", last=True)
+        self.assertEqual((r["step"], r["steps"]), (49, 49))
+        self.assertAlmostEqual(r["s_per_step"], 14.78, places=2)
+        self.assertEqual(r["elapsed_s"], 724.0)
+
+    def test_the_outcome_line_closes_the_run(self):
+        self.assertEqual(self.at("Pixel data"), {})
+
+    def test_the_journal_ends_in_the_next_request_encode(self):
+        # the tail of the window is the next call starting: the close of one run must
+        # not leak a stale denoise step into the read of the following one
+        r = lc.parse_video_run(self.msgs)
+        self.assertEqual(r["phase"], "encode")
+        self.assertIsNone(r["step"])
+
+
+
+class TheCockpitsRouteProbeIsNotAFailure(unittest.TestCase):
+    """The Decide view asks the proxy whether it serves /v1/systemone with a body that has no
+    state, which the proxy refuses at the schema without running a model. The request log
+    painted each of those a red failure, once a minute while the view was open. These are
+    the proxy's own lines for that probe, from the reference box on 2026-09-30."""
+    PROBE = ("2026-09-30T17:04:05+02:00 gx10-eff9 python3[4726]: [proxy] {peer} -> POST {path} body={size}b\n"
+             "2026-09-30T17:04:05+02:00 gx10-eff9 python3[4726]: [proxy] {peer} systemone INVALID: ['body', 'state'] Field required\n"
+             "2026-09-30T17:04:05+02:00 gx10-eff9 python3[4726]: [proxy] {peer} POST {path} {outcome} in 0.0s\n")
+
+    def row(self, peer="127.0.0.1:56836", path="/v1/systemone", size=40, outcome="422 systemone refused"):
+        rows = lc.parse_feed(self.PROBE.format(peer=peer, path=path, size=size, outcome=outcome))
+        self.assertEqual(len(rows), 1)
+        return lc.mark_probes(rows, "/v1/systemone", 40)[0]
+
+    def test_the_probe_reads_as_the_cockpits_own(self):
+        r = self.row()
+        self.assertEqual(r["kind"], "probe")
+        self.assertTrue(r["outcome"].startswith("422"), "the status stays in the words")
+
+    def test_the_same_refusal_from_a_client_is_still_a_failure(self):
+        self.assertEqual(self.row(peer="100.78.198.77:51000")["kind"], "fail")
+
+    def test_a_request_from_this_box_that_is_not_the_probe_body_is_still_a_failure(self):
+        self.assertEqual(self.row(size=57)["kind"], "fail")
+
+    def test_another_route_is_never_taken_for_the_probe(self):
+        self.assertEqual(self.row(path="/v1/chat/completions", outcome="422 bad request")["kind"], "fail")
+
+    def test_an_answered_request_keeps_its_own_outcome(self):
+        r = self.row(outcome="ok non-sse")
+        self.assertEqual((r["kind"], r["outcome"]), ("ok", "ok non-sse"))
+
+
+class TheStartGuardsWords(unittest.TestCase):
+    """engine-preflight.sh's lines, as the cockpit reads them from a unit's journal. Without
+    them a lane the guard held read "starting", and one it refused "keeps crashing"."""
+    W = ("preflight: qwen38-sglang.service waits: what is left of an engine still holds 16 GiB of GPU "
+         "memory: 1756018 sglang::stuck 16578 MiB")
+    R = ("preflight: NOT starting qwen38-sglang.service: what is left of an engine still holds 16 GiB of "
+         "GPU memory: 1756018 sglang::stuck 16578 MiB, still after 60 s. Starting into memory the driver "
+         "has not given back is how sglang#40948 froze a DGX Spark until a power cycle. Stop what holds "
+         "it, or reboot if nothing does; systemd tries again in 15 s.")
+    S = "preflight: qwen38-sglang.service starts: no GPU memory held from before, 115.7 GiB available (0 s)"
+    HELD = "what is left of an engine still holds 16 GiB of GPU memory: 1756018 sglang::stuck 16578 MiB"
+
+    def test_each_word_and_its_reason(self):
+        self.assertEqual(lc.parse_preflight([self.W]), {"verdict": "waits", "reason": self.HELD})
+        self.assertEqual(lc.parse_preflight([self.R]), {"verdict": "refused", "reason": self.HELD})
+        self.assertEqual(lc.parse_preflight([self.S])["verdict"], "starts")
+
+    def test_the_last_word_wins(self):
+        self.assertEqual(lc.parse_preflight([self.W, self.S])["verdict"], "starts")
+        self.assertEqual(lc.parse_preflight([self.S, self.W])["verdict"], "waits")
+        self.assertEqual(lc.parse_preflight([self.W, self.R])["verdict"], "refused")
+        self.assertEqual(lc.parse_preflight([self.W, "Started qwen38-sglang.service"])["verdict"], "waits")
+
+    def test_silence_and_noise_are_none(self):
+        for lines in ([], ["Starting qwen38-sglang.service..."], ["preflight: half a line"], [""]):
+            self.assertIsNone(lc.parse_preflight(lines), lines)
+
+    def test_a_journal_prefix_does_not_hide_it(self):
+        line = "2026-10-01T14:47:50+02:00 gx10-eff9 bash[1757029]: " + self.W
+        self.assertEqual(lc.parse_preflight([line])["verdict"], "waits")
+
+
+class TheGuardsFlags(unittest.TestCase):
+    W = {"verdict": "waits", "reason": "the GPU driver does not answer nvidia-smi"}
+    R = {"verdict": "refused", "reason": "the GPU driver does not answer nvidia-smi"}
+
+    def test_held_only_while_the_unit_runs_its_start_step(self):
+        st = {"state": "starting"}
+        self.assertEqual(lc.preflight_flags(st, unit_sub="start-pre", preflight=self.W)["held"], self.W["reason"])
+        # the guard passed and the engine's own command runs: its last word is history
+        self.assertNotIn("held", lc.preflight_flags(st, unit_sub="start", preflight=self.W))
+        self.assertNotIn("held", lc.preflight_flags({"state": "loading-weights"}, unit_sub="start-pre", preflight=self.W))
+
+    def test_refused_only_on_a_failed_unit(self):
+        st = {"state": "failed", "restarting": True}
+        out = lc.preflight_flags(st, unit_sub="auto-restart", preflight=self.R)
+        self.assertEqual((out["refused"], out["restarting"]), (self.R["reason"], True))
+        self.assertNotIn("refused", lc.preflight_flags({"state": "starting"}, unit_sub="start-pre", preflight=self.R))
+        self.assertNotIn("held", lc.preflight_flags(st, unit_sub="auto-restart", preflight=self.W))
+
+    def test_a_guard_that_let_it_start_or_said_nothing_adds_nothing(self):
+        st = {"state": "starting"}
+        self.assertIs(lc.preflight_flags(st, unit_sub="start-pre", preflight=None), st)
+        out = lc.preflight_flags(st, unit_sub="start-pre", preflight={"verdict": "starts", "reason": "x"})
+        self.assertEqual(out, st)
+        self.assertIsNot(out, st, "the state it was handed is not changed in place")
+
+
+class TheZombie(unittest.TestCase):
+    """A server alive without its scheduler: nothing restarts it unless the cockpit does."""
+
+    def plan(self, **kw):
+        args = dict(state="degraded", scheduler_alive=False, since=None, now=1000.0, after_s=120.0,
+                    enabled=True, cooldown_ok=True, job_running=False)
+        args.update(kw)
+        return lc.zombie_plan(**args)
+
+    def test_only_a_degraded_engine_with_no_scheduler_is_one(self):
+        for kw in ({"state": "ready"}, {"state": "warming-up"}, {"state": "wedged"},
+                   {"scheduler_alive": True}, {"scheduler_alive": None}):
+            with self.subTest(**kw):
+                self.assertEqual(self.plan(**kw), {"zombie": False, "since": None, "restart": False, "in": 0.0})
+
+    def test_it_waits_its_delay_from_the_first_sighting(self):
+        first = self.plan()
+        self.assertEqual(first, {"zombie": True, "since": 1000.0, "restart": False, "in": 120.0})
+        self.assertEqual(self.plan(since=1000.0, now=1060.0)["in"], 60.0)
+        self.assertFalse(self.plan(since=1000.0, now=1119.9)["restart"])
+        due = self.plan(since=1000.0, now=1120.0)
+        self.assertEqual((due["restart"], due["in"], due["since"]), (True, 0.0, 1000.0))
+
+    def test_it_restarts_only_when_allowed(self):
+        for kw in ({"enabled": False}, {"cooldown_ok": False}, {"job_running": True}):
+            with self.subTest(**kw):
+                out = self.plan(since=0.0, now=1000.0, **kw)
+                self.assertEqual((out["zombie"], out["restart"]), (True, False))
 
 if __name__ == '__main__':
     unittest.main()

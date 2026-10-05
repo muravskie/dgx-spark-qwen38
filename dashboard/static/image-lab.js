@@ -15,7 +15,7 @@ window.renderImageLab = function renderImageLab(data){
     : controller.ownership !== 'managed' ? 'externally owned'
     : !running ? controller.runtime : controller.healthy === true ? 'API ready' : 'API unavailable';
   const chip = document.getElementById('image-lane-chip');
-  if (chip){ chip.textContent = state; chip.className = 'chip ' + (running && controller.healthy === true ? 'ok' : running ? 'warn' : ''); }
+  if (chip){ chip.textContent = state; chip.className = 'cap ' + (running && controller.healthy === true ? 'ok' : running ? 'warn' : ''); }
   put('image-owner', controller ? (controller.ownership === 'managed' ? 'spark-model-controller' : controller.ownership || 'unknown') : 'unknown');
   put('image-runtime', controller ? controller.runtime : 'unknown');
   put('image-roles', controller && controller.roles ? controller.roles.join(' · ') : 'unknown');

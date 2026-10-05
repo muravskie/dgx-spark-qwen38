@@ -21,7 +21,7 @@ CI keeps true.
   HF cache (weights, pinned revisions)    ~/flashnext-ple (176B N-gram table)
 
   cockpit :30090 ── sudo exact argv ──> systemd (start/stop/switch/flush)
-      └── relay :30091 ──> opencode serve 127.0.0.1:4096 (Agent tab)
+      └── relay :30091 ──> opencode serve 127.0.0.1:4096 (Agent view)
 ```
 
 Everything the stack writes to the machine lives in one config dir,
@@ -40,7 +40,7 @@ launcher in `~/.local/bin`, and the two weight trees (HF cache, PLE dir).
 
 | file | the job | notes worth reading |
 |---|---|---|
-| `install.sh` | converging installer: refuses root before it writes, reads the installed unit so a re-run keeps your target, port, cache and context mode, renders every artifact from the pins, installs the cockpit as step 10/10 and ends on its URL | the convergence block and `resolve_flash_*_args` (a flag computed before convergence caused the worst bug in v1.8.0); pins at the top are a contract, not decoration |
+| `install.sh` | converging installer: refuses root before it writes, reads the installed unit so a re-run keeps your target, port, cache and context mode, renders every artifact from the pins, installs the cockpit as step 10/10, installs every other lane (since v1.20 the other text lane is this script started again for it, `QWEN38_SECONDARY`; the side lanes are their own installers), proves each new one with the served lane stopped once, and ends on its URL | the convergence block and `resolve_flash_*_args` (a flag computed before convergence caused the worst bug in v1.8.0); pins at the top are a contract, not decoration |
 | `keepalive-proxy.py` | the only component that reads bytes it does not control | keepalive at SSE event boundaries, zombie abort ordering (`x-override-rid`, abort *before* close, drain otherwise), oversize guard that counts via `/tokenize` and prices images from their headers, corruption tripwire, and since v6.20 a refusal for the request fields SGLang leaves unbounded and dies on rather than rejecting (`top_logprobs`/`logprobs`/`top_logprobs_num` past a ceiling, sglang#40076; `stop_token_ids` and `input_ids` past the vocabulary, learned from the one refusal message that names it; `n` past 128, sglang#31597, whose fixes were closed unmerged); the `v6.x` header is its real version, read live by the cockpit; since v6.19 it answers `POST /v1/systemone` itself (typed decisions read off `top_logprobs`, one single-token branch per question, never `token_ids_logprob`: that path kills this build's scheduler on a mixed batch, sglang#34719; the state is fenced with a start-up token so it cannot write the framing of its own question, the caller's socket is watched so an abandoned fan-out is stopped and aborted, and the request path is decoded once before any check reads it, the way the engine routes it) |
 | `run.sh` / `switch-model.sh` / `uninstall.sh` / `get.sh` | foreground serving, surgical live switch, read-only-first removal, one-liner bootstrap | the switch never starts, stops or restarts an engine (it restarts opencode-web when the limits change) and never touches images; it stages unit files at fixed paths because the cockpit's sudoers pins that argv exactly |
 | `oc-limits.sh` | the one table of opencode limits, three callers | the comment block next to each number *is* the measurement record; the ceiling/threshold/two-thousand-step invariant is CI-held |
@@ -91,6 +91,11 @@ launcher in `~/.local/bin`, and the two weight trees (HF cache, PLE dir).
     `/root` with a new API key and leaves every client on 401 against a
     healthy engine, which is the one failure shape this stack has that
     produces no error anywhere.
+13. No engine starts on memory the last one has not given back: every engine unit runs
+    `engine-preflight.sh` before its engine, every installer that writes such a unit puts
+    the script in place first (run on its own, the image installer would otherwise leave a
+    lane that never starts), one attempt fits in the unit's start timeout, and the script
+    is no input of the engine, so a new one never restarts a healthy engine.
 
 ## How a change moves through the repo
 

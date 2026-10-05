@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
-"""Keepalive proxy in front of SGLang (v6.25). No content logging, and the only
+"""Keepalive proxy in front of SGLang (v6.32). No content logging, and the only
 rewriting is the tool-schema guard (role 4); one route, POST /v1/systemone, is answered
 here instead of relayed (role 5).
 
-Five roles, nothing else:
+Six roles, nothing else:
 1. fill the silences of the SSE stream (SGLang's tool-call parser buffers the
    arguments: 127 s of measured silence for a 400-line file write) by injecting
    the OFFICIAL Anthropic "ping" event every KEEPALIVE_S seconds on the
    Anthropic dialect (an SSE comment ": keepalive" KILLS Claude-family parsers:
    measured 2026-08-23, client death 10-20 s after the first comment) and an
    authentic empty chunk on the OpenAI dialect (opencode/AI SDK stall detectors
-   ignore comments and drop the stream after ~140-180 s without a real chunk);
+   ignore comments and drop the stream after ~140-180 s without a real chunk). It
+   starts before the engine answers: SGLang sends a stream's headers with its first
+   chunk, after the queue and the prefill, so past KEEPALIVE_S without them the proxy
+   opens the stream itself (v6.31);
 2. never leave a generation running for a client that is gone: the proxy names every
    request itself (x-override-rid), POSTs /abort_request BEFORE it closes the upstream
    socket, and drains the answer when the engine offers no rid to abort with. The caller
    of a non-streamed answer, who hears nothing until it is whole, is watched instead: when
-   it leaves, the upstream is ended, and the engine drops the request on its own;
+   it leaves, the upstream is ended, and the engine drops the request on its own. So is the
+   caller of a stream until the engine answers (v6.31): a request queued behind a full KV
+   pool otherwise stayed in the engine's queue after its caller had gone;
 3. never lull a client on a dead upstream: past MAX_SILENCE_S an EXPLICIT SSE
    error event is sent, then the stream is closed. MAX_SILENCE_S must stay
    ABOVE the worst legitimate prefill (40 min measured for 690K tokens on a
@@ -29,7 +34,83 @@ Five roles, nothing else:
    labels read off top_logprobs, so a pipeline or an agent gets choice, score and
    yes/no probabilities from the model it already runs, with nothing generated and
    nothing parsed. The "System One endpoint" section below carries the design and
-   its receipts.
+   its receipts;
+6. keep a request through an engine restart: one that arrives while the engine does not
+   answer and its unit (PROXY_HOLD_UNITS) is on its way back waits for it, at most
+   PROXY_HOLD_MAX_S, instead of failing at once. A streamed one hears from the proxy at
+   once (200, then the keepalives of role 1); see "Holding a request" below.
+
+v6.32: /server_info no longer carries the engine's key anywhere. v6.24 took SGLang's key
+fields out of the answer, at the top and in every internal state, but the answer also
+repeats the engine's whole command line in launch_command, the key included (the flash lane
+on the reference box, found by the audit of 2026-10-03): a named client behind the wall could
+still read the one secret the wall keeps from it. The value of every key flag is now masked in
+every string of the answer, and the engine's key itself wherever it shows; the TLS key
+password field goes with the key fields.
+
+v6.31: a stream is kept, and watched, before the engine answers. SGLang holds a stream's
+status and headers back until its first chunk, after the request was queued and its prompt
+computed, and this proxy wrote nothing before them and did not watch the caller. On
+2026-10-03, eight agents whose contexts (771,301 tokens at 01:00) overflowed the KV pool
+(437,184) waited longer than opencode's 300 s for headers; opencode gave up and sent again, and
+each request it gave up on stayed queued until the engine reached it, computed its prompt for
+nobody, and was aborted at the proxy's first write: 704 between 01:24 and 11:36, and 163
+requests in the queue at the end, for eight agents. Now the caller of a stream is watched until the engine answers, and its leaving ends
+the upstream, which the engine sees within 4 s; past KEEPALIVE_S the stream is opened and
+kept alive, as a hold does; past MAX_SILENCE_S without the engine's first byte the request is
+dropped, as a silent stream is.
+
+v6.30: a level SGLang refuses at the top of a request that also names one in
+chat_template_kwargs is dropped. SGLang takes the chat_template_kwargs copy over the top-level
+one, so the top-level copy changed nothing but the answer, a 400 from its validation: omp's
+default dialect sends both (omp 18.4.9, 2026-10-01). The level the client put in
+chat_template_kwargs is kept, a null there is filled as an absent one is, and a top-level
+level SGLang accepts is still left alone.
+
+v6.29: a body that never arrived whole is not sent on. A caller that closed before the last
+byte of its body (a reset at once after sending, or a client dying mid-send) left the proxy
+a short read, and the proxy sent the engine what had come: of 300 requests closed so, 11
+were read short and sent on all the same. No engine can serve that, so nothing was
+generated, but no request should go out so. It now ends "CLIENT GONE before its body", and
+the engine is not asked. (The engine still sees a body cut short when the proxy closes its
+side as the request goes out, its caller gone: by design, the engine never has it.)
+
+v6.28: a request is held while its engine comes back (issue #26). systemd starts a crashed
+engine again 15 s after it stops, and the boot takes 7 to 11 min; every request of that
+window got a 503 at once, and the clients gave up long before the engine was back: opencode
+1.18.32 retried a 503 six times on its Retry-After and failed the session after 151 s
+(measured against a fake engine, 2026-10-01). Now a request that finds the engine not
+answering, while a unit named in PROXY_HOLD_UNITS is starting, between two attempts, up, or
+in the stop half of a restart, waits for it. A streamed request gets its 200 and the role-1 keepalives at once, which
+opencode and Claude Code both waited on for 400 s and then took the answer; a non-streamed
+one waits in silence. Should the request still fail once the wait is over (the engine not
+back within PROXY_HOLD_MAX_S, or the prompt too long for the lane that came back), a stream
+the proxy opened ends with an error event, and both clients then send it again (measured),
+to an engine that now answers. With no unit named, nothing waits. An engine's mid-stream
+cut now reaches the client as a cut, with no error event and no closing chunk: Claude Code
+sends a cut stream again as a stream, which the hold keeps alive, where the error event made
+it retry without one, held in silence, which it gave up on after about 330 s (an engine made
+a zombie under real clients on the reference box, 2026-10-01).
+
+v6.27: the second pass of the same review found the guards still judgeable by value type.
+The engine's request models (pydantic v2, lax) coerce "999999", 999999.0 and [-1] spelled
+as strings into the ints the scheduler then acts on, and the guards only read the raw
+JSON type, so the crash shapes were one pair of quotes away (verified against the
+installed build: n, logprobs, top_logprobs, top_logprobs_num, and the elements of
+stop_token_ids, input_ids and prompt). The guards now judge each value as the engine
+reads it (_engine_int), and the vertex route also judges parameters.sampling_params,
+which the scheduler spreads into SamplingParams. Found in review, 2026-09-26.
+
+v6.26: the review's three open guard findings, closed. S4: a key spelled with a \\u escape
+(e.g. \\u0074op_logprobs) carried none of the bytes the guards scanned for, so the ceiling and
+the token-id refusals were skipped; any \\u in the body now forces the parse. S5: the
+sampling and logprob guards also cover /v1/responses, /invocations and /vertex_generate,
+read input_ids as a batch of lists, read sampling_params as a list, read prompt as token
+ids on /v1/completions, and the oversize guard reaches /generate and the other non-/v1/
+generation routes. S6: the TLS handshake no longer runs in the accept loop (one silent
+connection parked every other client behind its timeout); it now runs in the connection's
+own thread on its own budget, and a handshake that dies leaves one journal line, no
+traceback. Found in review, 2026-09-24; fixed 2026-09-26.
 
 v6.25: a caller that leaves a non-streamed answer stops the generation. The proxy waited
 inside the upstream call for the whole answer, so it never saw that caller go and kept the
@@ -186,29 +267,108 @@ class EngineUnreachable(Exception):
     """The engine did not answer /tokenize: stopped, crashed, restarting or still loading."""
 
 
-# The image lane holds the GPU instead of a text engine once the box is switched to it,
-# and a text engine does not come back from that by itself. Asked only on the error path,
-# where the answer changes what the client is told, and at most every 5 s.
+# The image and video lanes hold the GPU instead of a text engine once the box is
+# switched to one of them, and a text engine does not come back from that by itself.
+# Asked only on the error path, where the answer changes what the client is told,
+# and at most every 5 s per lane.
 IMAGE_UNIT = "qwen38-image.service"
 _IMAGE_SEEN = {"ts": -1e9, "active": False}
+VIDEO_UNIT = "qwen38-video.service"
+_VIDEO_SEEN = {"ts": -1e9, "active": False}
+
+
+def _lane_active(unit: str, seen: dict) -> bool:
+    now = time.monotonic()
+    if now - seen["ts"] > 5:
+        try:
+            seen["active"] = subprocess.run(["systemctl", "is-active", "--quiet", unit],
+                                            timeout=2).returncode == 0
+        except Exception:
+            seen["active"] = False
+        seen["ts"] = now
+    return seen["active"]
 
 
 def image_lane_serving():
-    now = time.monotonic()
-    if now - _IMAGE_SEEN["ts"] > 5:
-        try:
-            _IMAGE_SEEN["active"] = subprocess.run(["systemctl", "is-active", "--quiet", IMAGE_UNIT],
-                                                   timeout=2).returncode == 0
-        except Exception:
-            _IMAGE_SEEN["active"] = False
-        _IMAGE_SEEN["ts"] = now
-    return _IMAGE_SEEN["active"]
+    return _lane_active(IMAGE_UNIT, _IMAGE_SEEN)
+
+
+def video_lane_serving():
+    return _lane_active(VIDEO_UNIT, _VIDEO_SEEN)
+
+
+# ── Holding a request while its engine comes back (v6.28, role 6) ──────────
+# Only the units the installed proxy names count: a proxy run by hand or by a test, with
+# PROXY_HOLD_UNITS unset, answers an absent engine at once, as it always did.
+HOLD_UNITS = tuple(os.environ.get("PROXY_HOLD_UNITS", "").split())
+HOLD_MAX_S = float(os.environ.get("PROXY_HOLD_MAX_S", "1200") or 0)
+HOLD_POLL_S = float(os.environ.get("PROXY_HOLD_POLL_S", "2") or 2)
+# An engine that answers again and still fails the request (its info route is up, its
+# generations still 503: a boot not quite done) gets it again this many times, each after a
+# pause. Without the bound and the pause, the request went back to it in a loop with no
+# sleep until PROXY_HOLD_MAX_S (found in review before v6.28 shipped).
+HOLD_ROUNDS_MAX = 10
+_HOLD_SEEN = {"ts": -1e9, "coming": False}
+_HOLD_LOCK = threading.Lock()
+
+
+# The systemd jobs that end with the unit started. A restart runs its stop half as the unit
+# "deactivating" under a job of type restart, and a stop under one of type stop (both read
+# from `systemctl list-jobs` on the reference box, 2026-10-01).
+_BACK_JOBS = ("start", "restart", "try-restart", "reload-or-start")
+
+
+def engine_coming():
+    """True when a unit named in PROXY_HOLD_UNITS is starting, waiting for its next attempt,
+    up, or stopping only to start again: a restart. A hold that ended on the restart's stop
+    half sent every waiting client an error to answer (seen 2026-10-01, when the cockpit
+    restarted an engine left without its scheduler). systemd is asked at most every 2 s."""
+    if not HOLD_UNITS or HOLD_MAX_S <= 0:
+        return False
+    with _HOLD_LOCK:
+        now = time.monotonic()
+        if now - _HOLD_SEEN["ts"] > 2:
+            try:
+                out = subprocess.run(["systemctl", "show", *HOLD_UNITS, "-p", "ActiveState", "--value"],
+                                     capture_output=True, text=True, timeout=3).stdout.split()
+                coming = any(st in ("active", "activating", "reloading") for st in out)
+                if not coming:
+                    jobs = subprocess.run(["systemctl", "list-jobs", "--no-legend", "--no-pager", *HOLD_UNITS],
+                                          capture_output=True, text=True, timeout=3).stdout
+                    coming = any(len(f) >= 3 and f[1] in HOLD_UNITS and f[2] in _BACK_JOBS
+                                 for f in (ln.split() for ln in jobs.splitlines()))
+                _HOLD_SEEN["coming"] = coming
+            except Exception:
+                _HOLD_SEEN["coming"] = False
+            _HOLD_SEEN["ts"] = now
+        return _HOLD_SEEN["coming"]
+
+
+def engine_answers():
+    """True when the engine answers at all: any status under 500 on its info route. A held
+    request may go then; 5xx is SGLang starting or stopping, and no answer is no engine."""
+    try:
+        headers = {"Authorization": f"Bearer {_api_key()}"}
+    except OSError:
+        headers = {}                    # a 401 still says an engine is there
+    req = urllib.request.Request(UPSTREAM + _INFO_ROUTE["path"], headers=headers)
+    try:
+        urllib.request.urlopen(req, timeout=10).read()
+        return True
+    except urllib.error.HTTPError as e:
+        return e.code < 500
+    except Exception:
+        return False
 
 
 def engine_gone_reason():
     """What an unanswering engine means on this box, and what brings it back."""
     if image_lane_serving():
         return ("This box is serving images right now (qwen38-image.service), and a text engine "
+                "does not come back by itself: switch back to a text lane from the cockpit's "
+                "switcher, or run ./switch-model.sh with a text target")
+    if video_lane_serving():
+        return ("This box is serving video right now (qwen38-video.service), and a text engine "
                 "does not come back by itself: switch back to a text lane from the cockpit's "
                 "switcher, or run ./switch-model.sh with a text target")
     return "It is stopped, restarting or still loading (a restart takes minutes, about 9 on a DGX Spark)"
@@ -224,6 +384,10 @@ UPSTREAM      = os.environ.get("UPSTREAM", "http://127.0.0.1:30000")
 KEEPALIVE_S   = float(os.environ.get("KEEPALIVE_S", "10"))
 MAX_SILENCE_S = float(os.environ.get("MAX_SILENCE_S", "3600"))
 CLIENT_IO_S   = float(os.environ.get("CLIENT_IO_S", "900"))   # write blocked toward a frozen client
+TLS_HANDSHAKE_S = float(os.environ.get("QWEN38_TLS_HANDSHAKE_S", "10"))
+# A TLS client that connects and then says nothing must not pin a handshake thread (or,
+# before S6, the accept loop itself) open for CLIENT_IO_S; the handshake gets this
+# short, separate budget.
 # Oversize guard (v6.7): a prompt longer than the engine's KV pool is not rejected by
 # this SGLang build, it wedges the scheduler (measured 29/08). The proxy learns the
 # pool size from /get_server_info once the upstream is healthy and refuses, with a
@@ -370,7 +534,26 @@ def _upstream_auth(handler):
 # /v1/... only, while _upstream_auth attaches the engine's key to everything relayed.
 OPEN_ROUTES = frozenset({"/health"})
 SERVER_INFO_ROUTES = frozenset({"/server_info", "/get_server_info"})
-KEY_FIELDS = ("api_key", "admin_api_key")
+KEY_FIELDS = ("api_key", "admin_api_key", "ssl_keyfile_password")
+# A secret flag's value, wherever a string of the answer repeats a command line (SGLang's
+# launch_command, v6.32): `--api-key K`, `--api-key=K`, quoted or not.
+SECRET_FLAG_VALUE = re.compile(r"(--(?:admin-api-key|api-key|ssl-keyfile-password)(?:=|\s+))"
+                               r"(\"[^\"]*\"|'[^']*'|\S+)")
+
+
+def mask_secrets(node):
+    """node with every secret flag's value masked in its strings, and the engine's own key
+    wherever it shows. A key under 8 characters is not looked for by value: no real one is
+    that short, and masking one would garble every string that happens to contain it."""
+    if isinstance(node, dict):
+        return {k: mask_secrets(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [mask_secrets(v) for v in node]
+    if isinstance(node, str):
+        node = SECRET_FLAG_VALUE.sub(r"\1<masked>", node)
+        if len(UPSTREAM_API_KEY) >= 8:
+            node = node.replace(UPSTREAM_API_KEY, "<masked>")
+    return node
 
 
 def strip_key_fields(data):
@@ -378,7 +561,9 @@ def strip_key_fields(data):
     serving key in clear there, at the top level and in every internal state (seen on
     the reference box, 2026-09-24). A caller of this proxy has no use for it: behind
     the wall it is the one secret a named client must not learn, and without the wall
-    the caller already holds it. Anything that is not a JSON object is left as it is."""
+    the caller already holds it. Anything that is not a JSON object is left as it is.
+    v6.32: the answer also repeats the engine's command line in launch_command, key
+    included, so every string of it goes through mask_secrets as well."""
     try:
         doc = json.loads(data)
     except Exception:
@@ -389,7 +574,7 @@ def strip_key_fields(data):
     for holder in holders:
         for field in KEY_FIELDS:
             holder.pop(field, None)
-    return json.dumps(doc).encode()
+    return json.dumps(mask_secrets(doc)).encode()
 
 
 # Tool-schema guard (v6.13): SGLang validates every tool's parameter schema with
@@ -494,34 +679,43 @@ SGLANG_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def route_reasoning_effort(body, path):
-    """The body to forward, and the level moved (or None). Untouched on any doubt."""
+    """(the body to forward, the level moved or None, the level dropped or None). Untouched
+    on any doubt."""
     if not body or not path.startswith("/v1/chat/completions"):
-        return body, None
+        return body, None, None
     if b'"reasoning_effort"' not in body:
-        return body, None               # hot path: one substring scan, no parse
+        return body, None, None         # hot path: one substring scan, no parse
     try:
         j = json.loads(body)
     except Exception:
-        return body, None               # not JSON we can fix: let the engine decide
+        return body, None, None         # not JSON we can fix: let the engine decide
     if not isinstance(j, dict):
-        return body, None
+        return body, None, None
     eff = j.get("reasoning_effort")
     if not isinstance(eff, str) or eff in SGLANG_EFFORTS:
-        return body, None
+        return body, None, None
     kw = j.get("chat_template_kwargs")
     if kw is None:
         kw = {}
     elif not isinstance(kw, dict):
-        return body, None               # the client means something else by that key
-    if "reasoning_effort" in kw:
-        return body, None               # the client already chose the open door
+        return body, None, None         # the client means something else by that key
+    if kw.get("reasoning_effort") is not None:
+        # The client named a level in both doors, the one SGLang refuses at the top. SGLang
+        # takes the chat_template_kwargs copy over the top-level one (a null there it skips,
+        # and the move below fills it), so the top-level copy changes nothing but the answer,
+        # a 400 (v6.30): it goes, the open door's level stays.
+        del j["reasoning_effort"]
+        try:
+            return json.dumps(j).encode(), None, eff
+        except Exception:
+            return body, None, None
     kw["reasoning_effort"] = eff
     j["chat_template_kwargs"] = kw
     del j["reasoning_effort"]
     try:
-        return json.dumps(j).encode(), eff
+        return json.dumps(j).encode(), eff, None
     except Exception:
-        return body, None
+        return body, None, None
 
 
 # OpenAI documents top_logprobs as "an integer between 0 and 20". SGLang declares it
@@ -554,18 +748,53 @@ def route_reasoning_effort(body, path):
 # element by element when a batch sends a list.
 TOP_LOGPROBS_CEILING = int(os.environ.get("TOP_LOGPROBS_CEILING", "1024") or 1024)
 TOP_LOGPROBS_FIELD = {"/v1/chat/completions": "top_logprobs", "/v1/completions": "logprobs",
-                      "/generate": "top_logprobs_num"}
+                      "/v1/responses": "top_logprobs", "/invocations": "top_logprobs",
+                      "/generate": "top_logprobs_num", "/vertex_generate": "top_logprobs_num"}
+
+
+def _engine_int(v):
+    """The int the engine will act on, or None when it will not act on a number at all.
+
+    The guards must judge what the engine executes, not what the client typed. The
+    request models are pydantic v2 in lax mode, and this build coerces integer floats
+    (3.0) and numeric strings ("999999", "-1", "3.0") into ints before the scheduler
+    ever sees them (checked against the installed SGLang, 2026-09-26). SamplingParams
+    additionally runs int() over every stop_token_ids element in __post_init__. So
+    top_logprobs "1000000" reaches logprob_processor.topk as 1000000, and a guard that
+    only tests isinstance(v, int) is one pair of quotes away from the crash. What is
+    not coerced ("abc", 3.5) is the engine's refusal to make, so it stands down; a bool
+    the engine does coerce to 0 or 1, which is always in range, so it stands down too.
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v) if v.is_integer() else None
+    if isinstance(v, str):
+        try:
+            f = float(v.strip())
+        except ValueError:
+            return None
+        return int(f) if f.is_integer() else None
+    return None
 
 
 def top_logprobs_over_ceiling(body, path):
     """(field, value) when a request asks for more logprob entries than the ceiling,
-    else None. Only an integer is judged: anything else is pydantic's refusal to make."""
+    else None. The value is judged as the engine will read it (see _engine_int): a
+    numeric string or integer float is coerced to the int the scheduler acts on, so the
+    guard cannot be fooled by typing the danger as "1000000"."""
     if TOP_LOGPROBS_CEILING <= 0 or not body:
         return None
-    field = TOP_LOGPROBS_FIELD.get(path.split("?")[0])
+    route = path.split("?")[0]
+    field = TOP_LOGPROBS_FIELD.get(route)
     if field is None:
         return None
-    if b'"' + field.encode() + b'"' not in body:
+    # S4: a key spelled with a \u escape (e.g. "\u0074op_logprobs") decodes to the very
+    # name this guard looks for, yet the byte scan would not see it. Any escape in the
+    # body voids the substring shortcut, so parse instead.
+    if b"\\u" not in body and b'"' + field.encode() + b'"' not in body:
         return None                     # hot path: one substring scan, no parse
     try:
         j = json.loads(body)
@@ -573,20 +802,92 @@ def top_logprobs_over_ceiling(body, path):
         return None                     # not JSON we can read: the engine's validator decides
     if not isinstance(j, dict):
         return None
+    if route == "/vertex_generate":
+        j = j.get("parameters") or {}
     asked = j.get(field)
     values = asked if isinstance(asked, list) else [asked]
-    over = [v for v in values
-            if isinstance(v, int) and not isinstance(v, bool) and v > TOP_LOGPROBS_CEILING]
+    over = []
+    for v in values:
+        iv = _engine_int(v)
+        if iv is not None and iv > TOP_LOGPROBS_CEILING:
+            over.append(iv)
     return (field, max(over)) if over else None
 
 
-def _sample_fields(j):
-    """The places SGLang reads these fields from: the top level of an OpenAI request, and
-    sampling_params for /generate. Nothing deeper, because nothing deeper is read."""
+def _sampling_holders(j, route):
+    """The dicts SGLang reads sampling/token-id fields from, for this route.
+
+    The top level is always one. /generate additionally reads them from
+    `sampling_params`, which is a single dict for one request or a list of one dict
+    per batched sequence (io_struct.GenerateReqInput). /vertex_generate carries the
+    sampling fields in a `parameters` block and the input tokens under each element of
+    `instances` (VertexGenerateReqInput spreads parameters into GenerateReqInput and
+    lifts instances[*].input_ids). The scheduler then runs SamplingParams(**dict) on
+    that sampling_params (tokenizer_manager), so a `parameters.sampling_params` block
+    reaches the sampler too. Nothing deeper is read by the engine, so we stop here.
+    """
+    if route == "/vertex_generate":
+        params = j.get("parameters")
+        if isinstance(params, dict):
+            yield params
+            nested = params.get("sampling_params")
+            if isinstance(nested, dict):
+                yield nested
+            elif isinstance(nested, list):
+                for item in nested:
+                    if isinstance(item, dict):
+                        yield item
+        for inst in j.get("instances") or []:
+            if isinstance(inst, dict):
+                yield inst
+        return
     yield j
     nested = j.get("sampling_params")
     if isinstance(nested, dict):
         yield nested
+    elif isinstance(nested, list):      # /generate batched sampling_params
+        for item in nested:
+            if isinstance(item, dict):
+                yield item
+
+
+def _iter_token_ids(ids):
+    """Yield the ints in a token-id field that may be a flat list or a batch of lists
+    (GenerateReqInput.input_ids is Union[List[int], List[List[int]]]; so is
+    CompletionRequest.prompt)."""
+    for tok in ids:
+        if isinstance(tok, list):
+            yield from tok
+        else:
+            yield tok
+
+
+def _id_violation(field, tok, vocab):
+    if tok < 0:
+        return (f"keepalive-proxy: {field} contains {tok}, and a negative token id "
+                f"indexes out of bounds on any vocabulary. The engine does not "
+                f"bound this field and dies on it rather than refusing it "
+                f"(sglang#31597), so it is refused here.")
+    if vocab and tok >= vocab:
+        return (f"keepalive-proxy: {field} contains {tok}, past the {vocab} tokens "
+                f"this lane serves (ids run 0 to {vocab - 1}). The engine does not "
+                f"bound this field and dies on it rather than refusing it "
+                f"(sglang#31597), so it is refused here.")
+    return None
+
+
+def _sampling_prealert(body, route):
+    """(might_carry_a_guarded_field, needs_vocab) by byte scan, no parse. A \\u escape
+    voids the shortcut (S4): it can spell any guarded key in bytes the scan would not
+    see, so the body must be parsed. prompt-as-token-ids exists only on /v1/completions
+    and only when the value is a JSON array, not a string. `n` needs no vocabulary."""
+    if b"\\u" in body:
+        return True, True
+    needs_vocab = any(b'"' + f.encode() + b'"' in body for f in TOKEN_ID_FIELDS)
+    has_prompt_ids = (route == "/v1/completions"
+                      and re.search(rb'"prompt"\s*:\s*\[', body) is not None)
+    might = needs_vocab or has_prompt_ids or b'"n"' in body
+    return might, (needs_vocab or has_prompt_ids)
 
 
 def sampling_field_refusal(body, path, vocab):
@@ -595,8 +896,8 @@ def sampling_field_refusal(body, path, vocab):
     known and only the ids no vocabulary can hold are refused."""
     if not body or path.split("?")[0] not in SAMPLE_GUARD_ROUTES:
         return None
-    if not any(b'"' + f.encode() + b'"' in body for f in TOKEN_ID_FIELDS) \
-            and b'"n"' not in body:
+    might, _ = _sampling_prealert(body, path.split("?")[0])
+    if not might:
         return None                     # hot path: substring scans, no parse
     try:
         j = json.loads(body)
@@ -604,31 +905,35 @@ def sampling_field_refusal(body, path, vocab):
         return None
     if not isinstance(j, dict):
         return None
-    for holder in _sample_fields(j):
+    route = path.split("?")[0]
+    for holder in _sampling_holders(j, route):
         for field in TOKEN_ID_FIELDS:
             ids = holder.get(field)
             if not isinstance(ids, list):
                 continue
-            for tok in ids:
-                if isinstance(tok, bool) or not isinstance(tok, int):
-                    continue            # a non-integer is the engine's refusal to make
-                if tok < 0:
-                    return (f"keepalive-proxy: {field} contains {tok}, and a negative token id "
-                            f"indexes out of bounds on any vocabulary. The engine does not "
-                            f"bound this field and dies on it rather than refusing it "
-                            f"(sglang#31597), so it is refused here.")
-                if vocab and tok >= vocab:
-                    return (f"keepalive-proxy: {field} contains {tok}, past the {vocab} tokens "
-                            f"this lane serves (ids run 0 to {vocab - 1}). The engine does not "
-                            f"bound this field and dies on it rather than refusing it "
-                            f"(sglang#31597), so it is refused here.")
-        n = holder.get("n")
-        if MAX_PARALLEL_SAMPLES > 0 and isinstance(n, int) and not isinstance(n, bool) \
-                and n > MAX_PARALLEL_SAMPLES:
+            for tok in _iter_token_ids(ids):
+                iv = _engine_int(tok)
+                if iv is None:
+                    continue            # not an int the engine will run: its validator decides
+                bad = _id_violation(field, iv, vocab)
+                if bad:
+                    return bad
+        n = _engine_int(holder.get("n"))
+        if MAX_PARALLEL_SAMPLES > 0 and n is not None and n > MAX_PARALLEL_SAMPLES:
             return (f"keepalive-proxy: n={n} exceeds the {MAX_PARALLEL_SAMPLES} parallel samples "
                     f"this proxy relays. The engine expands that list before anything is "
                     f"scheduled and does not bound it (sglang#31597). OpenAI's own maximum "
                     f"is 128.")
+    # /v1/completions' prompt doubles as raw token ids (List[int] or List[List[int]]),
+    # which index the embedding directly.
+    if route == "/v1/completions" and isinstance(j.get("prompt"), list):
+        for tok in _iter_token_ids(j["prompt"]):
+            iv = _engine_int(tok)
+            if iv is None:
+                continue
+            bad = _id_violation("prompt", iv, vocab)
+            if bad:
+                return bad
     return None
 
 
@@ -1048,7 +1353,17 @@ def served_vocab():
 # probe above worked; an id at or past the vocabulary is refused only once it is known.
 TOKEN_ID_FIELDS = ("stop_token_ids", "input_ids")
 MAX_PARALLEL_SAMPLES = int(os.environ.get("MAX_PARALLEL_SAMPLES", "128") or 128)
-SAMPLE_GUARD_ROUTES = ("/v1/chat/completions", "/v1/completions", "/generate")
+# Routes that hand a body to the sampler. S5: /v1/responses, /invocations and
+# /vertex_generate reach the same sampler under aliases the old list missed.
+SAMPLE_GUARD_ROUTES = frozenset({
+    "/v1/chat/completions", "/v1/completions", "/generate",
+    "/v1/responses", "/invocations", "/vertex_generate"})
+def _is_prompt_route(route):
+    # S5: the oversize guard keyed on the /v1/ prefix, so /generate and the other
+    # non-/v1 generation aliases (Vertex, SageMaker, ollama) skipped it entirely and a
+    # 1 MB body was relayed with no estimate. The prefix stays, and these are added.
+    return route.startswith("/v1/") or route in (
+        "/generate", "/invocations", "/vertex_generate", "/api/chat", "/api/generate")
 # ---- System One endpoint (v6.19) ------------------------------------------------
 # POST /v1/systemone speaks the wire contract of TypeSafe's Jev (docs.typesafe.ai/api):
 # one `state`, a map of typed `questions` (choice, score, noul), and one typed answer
@@ -2194,10 +2509,16 @@ def marker_run(text, run):
     return (run + tail) if not stripped else tail
 
 
-def sse_error_openai(msg):
-    data = json.dumps({"error": {"type": "corrupted_output", "code": "corrupted_output",
-                                 "message": f"keepalive-proxy: {msg}"}})
+def sse_error_openai(msg, kind="corrupted_output", code=None):
+    data = json.dumps({"error": {"type": kind, "code": code or kind, "message": f"keepalive-proxy: {msg}"}})
     return b"data: " + data.encode() + b"\n\n"
+
+
+# Role 1's keepalives. Anthropic dialect: the official ping event. OpenAI dialect: an
+# AUTHENTIC empty chunk (choices: []), because client stall detectors (opencode/AI SDK,
+# deaths measured at ~140-180 s) ignore comments.
+KA_ANTHROPIC = b'event: ping\ndata: {"type": "ping"}\n\n'
+KA_OPENAI = b'data: {"id":"keepalive","object":"chat.completion.chunk","created":0,"model":"keepalive","choices":[]}\n\n'
 
 
 def sse_error(msg):
@@ -2208,6 +2529,18 @@ def sse_error(msg):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128
+
+    def handle_error(self, request, client_address):
+        # A TLS client that vanishes mid-handshake (S6), and a client that cuts the wire
+        # mid-stream, both land here. They are traffic, not faults: one journal line, no
+        # traceback in a journal the cockpit renders.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, socket.timeout, TimeoutError,
+                            ConnectionResetError, BrokenPipeError)):
+            log(f"{client_address[0]}:{client_address[1]} dropped before a whole request "
+                f"({type(exc).__name__})")
+            return
+        super().handle_error(request, client_address)
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -2221,6 +2554,21 @@ class H(BaseHTTPRequestHandler):
 
     def setup(self):
         BaseHTTPRequestHandler.setup(self)
+        if isinstance(self.connection, ssl.SSLSocket):
+            # S6: the listening socket is wrapped with do_handshake_on_connect=False, so
+            # the accept loop never waits on a handshake; it happens here, in this
+            # connection's own thread, on its own short budget. A client that connects
+            # and says nothing costs one thread for TLS_HANDSHAKE_S, not every other
+            # client's connection for the handshake timeout.
+            self.connection.settimeout(TLS_HANDSHAKE_S)
+            try:
+                self.connection.do_handshake()
+            except OSError as e:
+                # log(), not log_error(): this class mutes log_message, so the base
+                # logger would print nothing to a journal that is the only witness.
+                log(f"TLS handshake from {self.client_address[0]} failed: {type(e).__name__}")
+                self.close_connection = True
+                return
         # a write blocked for CLIENT_IO_S (frozen client, laptop asleep) raises
         # socket.timeout instead of parking the thread forever
         self.connection.settimeout(CLIENT_IO_S)
@@ -2317,23 +2665,53 @@ class H(BaseHTTPRequestHandler):
                f"{engine_gone_reason()}; this request was NOT refused for its size. Retry it "
                f"unchanged once GET {UPSTREAM}/health answers 200.")
         body = json.dumps({"type": "error", "error": {"type": "engine_unavailable", "message": msg}}).encode()
-        try: self._plain(503, {"Content-Type": "application/json", "Retry-After": "30"}, body)
+        try: self._answer(503, {"Content-Type": "application/json", "Retry-After": "30"}, body)
         except Exception: pass
+
+    def _warming(self):
+        """The pool of a restarted engine is not measured yet and this prompt is too big to
+        relay blind (warmup_hold): try again, never a size refusal."""
+        self._answer(503, {"Content-Type": "application/json", "Retry-After": "30"},
+                     json.dumps({"error": {"type": "engine_warming",
+                                           "message": "keepalive-proxy: the engine restarted and its KV pool is not measured yet; retry in a few seconds"}}).encode())
 
     def _upstream_error(self, herr):
         """Relay the engine's own error, except its 5xx: SGLang answers 503 with an empty
-        body while starting or shutting down, which a client cannot read. Say it instead."""
+        body while starting or shutting down, which a client cannot read. Say it instead.
+        (A generation's 5xx is seen first by _forward, which may hold it: role 6.)"""
         raw = herr.read()
         try: herr.close()
         except Exception: pass
         if herr.code in (502, 503, 504):
             self._unavailable(f"it answered HTTP {herr.code}, as it does while starting or shutting down")
             self._done(f"503 engine unreachable (upstream {herr.code})"); return
-        try: self._plain(herr.code, dict(herr.headers), raw)
+        try: self._answer(herr.code, dict(herr.headers), raw)
         except Exception: pass
         self._done(f"{herr.code} upstream")
 
+    def _answer(self, status, headers, body):
+        """An answer the proxy writes itself: as it is, or, in a stream the proxy opened while
+        it held the request (role 6), as an error event of that stream. Both opencode and
+        Claude Code answer such an event by sending the request again (measured 2026-10-01),
+        and by then the engine answers, so the retry gets the real answer."""
+        if not getattr(self, "_held_sse", False):
+            self._plain(status, headers, body); return
+        try:
+            err = json.loads(body).get("error") or {}
+            msg = str(err.get("message") or "")
+            kind, code = str(err.get("type") or "engine_unavailable"), err.get("code")
+        except Exception:
+            msg, kind, code = "", "engine_unavailable", None
+        msg = (msg or body[:300].decode("utf-8", "replace") or f"HTTP {status}").removeprefix("keepalive-proxy: ")
+        try:
+            self._chunk(sse_error(msg) if self.path.startswith("/v1/messages")
+                        else sse_error_openai(msg, kind, code))
+        except Exception: pass
+        self._finish()
+
     def _begin(self, status, headers):
+        if getattr(self, "_held_sse", False):
+            return                      # the hold already sent this stream's 200 and headers
         self.close_connection = True
         self.send_response(status)
         for k, v in headers.items():
@@ -2474,6 +2852,78 @@ class H(BaseHTTPRequestHandler):
                 except Exception: pass
             raise
 
+    def _client_left(self):
+        """Whether the caller closed its side, asked without waiting: the peek _watch_client
+        makes, for a non-streamed request that waits in silence while the engine is away."""
+        sock = self.connection
+        if isinstance(sock, ssl.SSLSocket):
+            return False                 # a peek through TLS is not this simple
+        try:
+            readable, _, _ = select.select([sock], [], [], 0)
+            if not readable:
+                return False
+            return not sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        except BlockingIOError:
+            return False
+        except (OSError, ValueError):
+            return True
+
+    def _hold(self, why, streamed):
+        """Wait while the engine comes back (role 6). True once it answers again, so the request
+        can go to it now; False when it is not on its way back, when PROXY_HOLD_MAX_S has passed,
+        or when the caller left (then self._caller_left). A hold only begins on an engine that
+        does not answer: one that answers and failed the request is here, not on its way back,
+        and waiting would only replay the failure. Once a hold began, an engine that answers
+        again and still fails the request (a boot not quite done) gets it again, at most
+        HOLD_ROUNDS_MAX times, each after a pause."""
+        if not engine_coming():
+            return False
+        if self._hold_until is None:
+            if engine_answers():
+                return False
+            self._hold_until = time.time() + HOLD_MAX_S
+            self._held_from = time.time()
+            self._hold_rounds = 0
+            log(f"{self._peer} holding: the engine does not answer ({why[:120]}) and its unit is on its "
+                f"way back; this request waits for it, at most {HOLD_MAX_S:.0f}s")
+        else:
+            # it answered again and the request failed again: a boot not quite done
+            self._hold_rounds += 1
+            if self._hold_rounds > HOLD_ROUNDS_MAX:
+                log(f"{self._peer} the engine answers and failed this request {HOLD_ROUNDS_MAX} more "
+                    f"times ({why[:120]}); not waiting any longer")
+                return False
+        anthropic = self.path.startswith("/v1/messages")
+        if streamed and not getattr(self, "_held_sse", False):
+            # the 200 and the stream's headers now, then role 1's keepalives: a client hears
+            # from the proxy at once, as it does during a long prefill
+            try: self._begin(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+            except Exception:
+                self._caller_left = True; return False
+            self._held_sse = True
+        next_ka = 0.0
+        pause = self._hold_rounds > 0           # a pause before the engine is asked again
+        while time.time() < self._hold_until:
+            if streamed:
+                if time.time() >= next_ka:
+                    try: self._chunk(KA_ANTHROPIC if anthropic else KA_OPENAI)
+                    except Exception:
+                        self._caller_left = True; return False
+                    next_ka = time.time() + KEEPALIVE_S
+            elif self._client_left():
+                self._caller_left = True; return False
+            if pause:
+                pause = False
+            elif engine_answers():
+                log(f"{self._peer} the engine answers again after {time.time() - self._held_from:.0f}s held; relaying")
+                return True
+            if not engine_coming():
+                log(f"{self._peer} the engine's unit is no longer on its way back; not waiting for it")
+                return False
+            time.sleep(HOLD_POLL_S)
+        log(f"{self._peer} held {HOLD_MAX_S:.0f}s and the engine is still not back")
+        return False
+
     def _watch_client(self, done):
         """The caller of a non-streamed answer hears nothing until it is whole, so this proxy
         never wrote to it, never saw it leave, and kept the upstream open: the engine
@@ -2508,16 +2958,106 @@ class H(BaseHTTPRequestHandler):
             except OSError:
                 pass
             self._caller_left = True
-            while not done.is_set():     # the upstream may not be connected yet (loopback: not for long)
-                conn = getattr(getattr(self, "_upstream_req", None), "upstream", None)
-                up = getattr(conn, "sock", None)
-                if up is not None:
-                    try: up.shutdown(socket.SHUT_RDWR)
-                    except OSError: pass
-                    log(f"{self._peer} client gone before its non-streamed answer: upstream "
-                        f"closed, the engine drops the request at its next disconnect check")
+            self._end_upstream(done, "client gone before its non-streamed answer")
+            return
+
+    def _end_upstream(self, done, why):
+        """Close the connection to the engine while _open still waits on it. SGLang checks its
+        HTTP client every 4 s while a request waits, queued or prefilling (_wait_one_response),
+        and aborts the request itself once it sees it gone, its state still there."""
+        while not done.is_set():         # the upstream may not be connected yet (loopback: not for long)
+            conn = getattr(getattr(self, "_upstream_req", None), "upstream", None)
+            up = getattr(conn, "sock", None)
+            if up is not None:
+                try: up.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                log(f"{self._peer} {why}: upstream closed, the engine drops the request at its next "
+                    f"disconnect check")
+                return
+            done.wait(0.05)
+
+    def _keep_waiting(self, done):
+        """A stream, while the engine has not answered yet (v6.31).
+
+        SGLang sends a stream's status and headers with its first chunk, so only once the
+        request was queued, scheduled and its prompt computed: it holds the first chunk back
+        to answer a request it cannot validate with a real HTTP 400 (serving_chat.py,
+        _handle_streaming_request, in the image the flash lane serves). This proxy relayed
+        those headers when they came, wrote nothing before, and did not watch the caller,
+        trusting the keepalives that only start with the headers. With eight agents whose
+        contexts overflowed the KV pool (2026-10-03), requests waited past opencode's 300 s
+        for headers (its headerTimeout), opencode gave up and sent them again, and every one
+        it gave up on stayed queued in the engine until its turn came: 704 in a night, each
+        computing a prompt of about 100,000 tokens for nobody, and 163 requests in the queue
+        at the end, for eight agents.
+
+        So, until the engine answers: the caller is watched as a non-streamed one is, and
+        its leaving ends the upstream at once; after KEEPALIVE_S the stream is opened (200
+        and its headers, as a hold opens it) and role 1's keepalives are written into it,
+        which keeps a client waiting as long as the engine needs and finds a closed one at
+        the next write; past MAX_SILENCE_S the request is dropped, as a silent stream is."""
+        try:
+            self._keep_waiting_inner(done)
+        except Exception as e:          # never silently: a keeper that died left a stream unwatched
+            log(f"{getattr(self, '_peer', '?')} the stream keeper failed: {type(e).__name__}: {e}")
+
+    def _keep_waiting_inner(self, done):
+        # An engine that answers at once is the relay's, as before: its leaving caller is
+        # aborted by rid or drained there. Ending the upstream of a stream the engine has
+        # already begun could orphan its generation (sglang#35255, in neither image served
+        # here), so the watch starts once the engine has kept the stream waiting. The times
+        # count from the request going out.
+        start = time.time()
+        if done.wait(min(1.0, KEEPALIVE_S)):
+            return
+        sock = self.connection
+        peek = not isinstance(sock, ssl.SSLSocket)   # a peek through TLS is not this simple
+        anthropic = self.path.startswith("/v1/messages")
+        next_ka = start + KEEPALIVE_S
+        while not done.is_set():
+            now = time.time()
+            if now - start >= MAX_SILENCE_S:
+                self._silent_before_head = now - start
+                self._end_upstream(done, f"the engine has not answered in {now - start:.0f}s")
+                return
+            if now >= next_ka:
+                with self._wlock:
+                    if done.is_set():
+                        return
+                    try:
+                        if not getattr(self, "_held_sse", False):
+                            self._begin(200, {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+                            self._held_sse = True
+                            log(f"{self._peer} the engine has not answered in {now - start:.0f}s: stream "
+                                f"opened, keepalives until it does")
+                        self._chunk(KA_ANTHROPIC if anthropic else KA_OPENAI)
+                    except Exception:
+                        self._caller_left = True
+                if getattr(self, "_caller_left", False):
+                    self._abort_upstream("client gone before the engine answered")
+                    self._end_upstream(done, "client gone before the engine answered")
                     return
-                done.wait(0.05)
+                next_ka = now + KEEPALIVE_S
+            if not peek:
+                done.wait(min(0.5, max(0.0, next_ka - time.time())))
+                continue
+            try:
+                readable, _, _ = select.select([sock], [], [], min(0.5, max(0.0, next_ka - time.time())))
+            except (OSError, ValueError):
+                return
+            if not readable:
+                continue
+            try:
+                if sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
+                    peek = False         # the client sent bytes: pipelining, not a goodbye
+                    continue
+            except BlockingIOError:
+                continue
+            except OSError:
+                pass
+            self._caller_left = True
+            self._abort_upstream("client gone before the engine answered")
+            self._end_upstream(done, "client gone before the engine answered")
             return
 
     def _drain_detached(self, resp):
@@ -2538,6 +3078,16 @@ class H(BaseHTTPRequestHandler):
 
     def _relay_inner(self, resp):
         sse = "text/event-stream" in (resp.headers.get("Content-Type") or "")
+        if not sse and getattr(self, "_held_sse", False):
+            # the stream this proxy opened while it held the request cannot carry a document:
+            # the engine answered a streamed request without a stream, so say so in it
+            raw = resp.read(65536)
+            try: resp.close()
+            except Exception: pass
+            self._answer(502, {}, json.dumps({"error": {"type": "engine_unavailable", "message":
+                         "the engine answered this streamed request without a stream: "
+                         + raw[:200].decode("utf-8", "replace")}}).encode())
+            self._done("UPSTREAM CUT non-sse"); return
         self._begin(resp.status, resp.headers)
         if not sse:
             # A non-streamed answer is relayed as it arrives, so it cannot be withheld;
@@ -2662,11 +3212,7 @@ class H(BaseHTTPRequestHandler):
                 drain.set()
 
         anthropic = self.path.startswith("/v1/messages")
-        # anthropic dialect: official ping event. openai dialect: an AUTHENTIC
-        # empty chunk (choices: []), because client stall detectors
-        # (opencode/AI SDK, deaths measured at ~140-180 s) ignore comments
-        ka_bytes = (b'event: ping\ndata: {"type": "ping"}\n\n' if anthropic
-                    else b'data: {"id":"keepalive","object":"chat.completion.chunk","created":0,"model":"keepalive","choices":[]}\n\n')
+        ka_bytes = KA_ANTHROPIC if anthropic else KA_OPENAI
         silence = 0.0
         while True:
             try:
@@ -2689,10 +3235,20 @@ class H(BaseHTTPRequestHandler):
                 break
             if kind == "e":
                 log(f"upstream cut mid-stream: {val.decode(errors='replace')[:120]}")
-                if anthropic:
-                    try: self._chunk(sse_error("upstream stream interrupted, retry"))
-                    except Exception: pass
-                break
+                # The engine's end, passed on as it came: the client's stream is cut too, with
+                # no chunk to close the response, so a client cannot take the part it got for
+                # an answer, and retries as it does a broken connection. Claude Code sends a
+                # cut stream again as a stream, which a hold keeps alive with its pings; the
+                # error event this sent before made it fall back to a request without a
+                # stream, held in silence, which it gave up on after about 330 s, three
+                # times over one restart, and it ended with no answer (the reference box,
+                # 2026-10-01).
+                self.close_connection = True
+                try: self.connection.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+                try: resp.close()
+                except Exception: pass
+                self._done("UPSTREAM CUT"); return
             now = time.time() - self._t0
             if self._first is None: self._first = now
             self._last = now; self._bytes += len(val)
@@ -2749,6 +3305,12 @@ class H(BaseHTTPRequestHandler):
             self._done("413 body over cap"); return
         body = self.rfile.read(n) if (with_body and n) else None
         self._body_read = True
+        if body is not None and len(body) < n:
+            # The caller closed before its body arrived whole: what came is no request, and
+            # the engine is not given it (v6.29).
+            log(f"{self._peer} the caller left before its body arrived whole ({len(body)} of {n} bytes)")
+            self.close_connection = True
+            self._done("CLIENT GONE before its body"); return
         over = top_logprobs_over_ceiling(body, self.path)
         if over is not None:
             field, asked = over
@@ -2768,24 +3330,27 @@ class H(BaseHTTPRequestHandler):
         # The vocabulary is asked for only when a request carries a field that needs one,
         # never for `n` alone, which plenty of ordinary clients send: a probe on the hot
         # path of every request would be the cost this guard exists to prevent.
-        if body and self.path.split("?")[0] in SAMPLE_GUARD_ROUTES \
-                and (any(b'"' + f.encode() + b'"' in body for f in TOKEN_ID_FIELDS)
-                     or b'"n"' in body):
-            needs_vocab = any(b'"' + f.encode() + b'"' in body for f in TOKEN_ID_FIELDS)
-            refusal = sampling_field_refusal(body, self.path,
-                                             served_vocab() if needs_vocab else 0)
-            if refusal:
-                log(f"{self._peer} REFUSED a sampling field the engine dies on: {refusal[17:100]}")
-                self._plain(400, {"Content-Type": "application/json"},
-                            json.dumps({"error": {"type": "invalid_request",
-                                                  "message": refusal}}).encode())
-                self._done("400 sampling field out of range"); return
+        if body and self.path.split("?")[0] in SAMPLE_GUARD_ROUTES:
+            might, needs_vocab = _sampling_prealert(body, self.path.split("?")[0])
+            if might:
+                refusal = sampling_field_refusal(body, self.path,
+                                                 served_vocab() if needs_vocab else 0)
+                if refusal:
+                    log(f"{self._peer} REFUSED a sampling field the engine dies on: {refusal[17:100]}")
+                    self._plain(400, {"Content-Type": "application/json"},
+                                json.dumps({"error": {"type": "invalid_request",
+                                                      "message": refusal}}).encode())
+                    self._done("400 sampling field out of range"); return
         body, dropped = sanitize_tool_schemas(body, self.path)
-        body, moved_effort = route_reasoning_effort(body, self.path)
+        body, moved_effort, dropped_effort = route_reasoning_effort(body, self.path)
         if moved_effort and _effort_move_logged.first(moved_effort):   # once per level, not per request
             shown = repr(moved_effort[:40]) + ("..." if len(moved_effort) > 40 else "")
             log(f"{self._peer} reasoning_effort={shown} is not in SGLang's enum; "
                 f"relayed inside chat_template_kwargs so the chat template can read it")
+        if dropped_effort and _effort_move_logged.first("top-level copy " + dropped_effort):
+            shown = repr(dropped_effort[:40]) + ("..." if len(dropped_effort) > 40 else "")
+            log(f"{self._peer} reasoning_effort={shown} is not in SGLang's enum and chat_template_kwargs "
+                f"names a level too, which SGLang takes first: the top-level copy is dropped")
         for pat in dropped:                 # once per distinct pattern, not per request
             if _pattern_drop_logged.first(pat):
                 log(f"{self._peer} tool schema: dropped a 'pattern' Python's re cannot "
@@ -2797,7 +3362,35 @@ class H(BaseHTTPRequestHandler):
         # or held while the pool was unmeasured, it could not learn it (found in review,
         # 2026-09-24).
         count_only = self.path.split("?", 1)[0] in COUNT_ONLY_PATHS
-        if body and self.path.startswith("/v1/") and len(body) > 200_000 and not count_only:
+        streamed = bool(body) and not answered_whole(body)
+        self._hold_until = None
+        self._held_sse = False
+        while True:
+            gone = self._forward(body, count_only)
+            if gone is None:
+                return
+            kind, why, detail = gone
+            if self._hold(why, streamed):
+                continue                    # the engine answers again: the request goes now
+            if getattr(self, "_caller_left", False):
+                self._done("CLIENT GONE during hold"); return
+            if kind == "warming":
+                log(f"{self._peer} REFUSED monster with unknown pool ({len(body)}b, est ~{detail} tokens); engine warming up")
+                self._warming(); self._done("503 monster held during warmup"); return
+            self._unavailable(why)
+            if kind == "upstream":
+                self._done(f"503 engine unreachable (upstream {detail})"); return
+            self._done("503 engine unreachable"); return
+
+    def _forward(self, body, count_only):
+        """The request from the size guard to its answer. None once it is answered. When the
+        engine did not answer, nothing has been sent to it or answered yet, and this returns
+        (kind, why, detail) instead, so that _handle_inner may hold the request until the
+        engine is back (role 6) or else say why it is not there."""
+        # S5: the prefix test alone let /generate and the Vertex and SageMaker aliases
+        # slip through unmeasured; _is_prompt_route adds them without changing the
+        # /v1/ behavior that was already correct.
+        if body and _is_prompt_route(self.path.split("?", 1)[0]) and len(body) > 200_000 and not count_only:
             pool = pool_tokens()
             est = len(body) / CHARS_PER_TOKEN_MIN     # optimistic: fewest tokens the body could be
             if pool is None:
@@ -2808,11 +3401,7 @@ class H(BaseHTTPRequestHandler):
                 # engine. 503, never 400: the request may be perfectly servable
                 # once the pool is known, so this is "try again", not "refused".
                 if warmup_hold(est, pool):
-                    log(f"{self._peer} REFUSED monster with unknown pool ({len(body)}b, est ~{int(est)} tokens); engine warming up")
-                    self._plain(503, {"Content-Type": "application/json", "Retry-After": "30"},
-                                json.dumps({"error": {"type": "engine_warming",
-                                                      "message": "keepalive-proxy: the engine restarted and its KV pool is not measured yet; retry in a few seconds"}}).encode())
-                    self._done("503 monster held during warmup"); return
+                    return ("warming", "the engine restarted and its KV pool is not measured yet", int(est))
             elif est > prompt_limit(pool):
                 # v6.8: the size estimate only nominates; the engine's tokenizer decides
                 # (a 140k-token English prompt is 479 KB, which the 2.5 chars/token bound
@@ -2822,7 +3411,7 @@ class H(BaseHTTPRequestHandler):
                     count = tokenize_count(body, self.path)
                 except EngineUnreachable as e:
                     invalidate_pool()   # this engine is restarting; its pool is not ours
-                    self._unavailable(e); self._done("503 engine unreachable"); return
+                    return ("unreachable", str(e), None)
                 if count is None:
                     reason = (f"at least ~{int(est)} tokens by size (a shape the engine's tokenizer "
                               f"cannot count, so the size decides)")
@@ -2848,23 +3437,32 @@ class H(BaseHTTPRequestHandler):
                            f"itself is up: compact the conversation, drop image attachments, or serve a "
                            f"larger pool.")
                     log(f"{self._peer} REFUSED oversize ({len(body)}b, {reason}, limit {limit})")
-                    self._plain(400, {"Content-Type": "application/json"},
-                                json.dumps({"error": {"type": "context_too_long",
+                    self._answer(400, {"Content-Type": "application/json"},
+                                 json.dumps({"error": {"type": "context_too_long",
                                                       "code": "context_length_exceeded",
                                                       "param": "messages",
                                                       "message": msg}}).encode())
-                    self._done("400 oversize refused"); return
-        # A non-streamed answer's headers only come once it is whole, so this proxy waits
-        # inside _open for the whole generation and cannot see the caller leave: its socket
-        # is watched for exactly that wait. A stream is not: its relay writes every
-        # KEEPALIVE_S and finds a closed client at the next write.
+                    self._done("400 oversize refused"); return None
+        # The engine's headers come once a non-streamed answer is whole, and once a stream's
+        # first chunk is out, after its queue and its prefill (_keep_waiting). Until then this
+        # proxy waits inside _open, and the caller is watched for that wait: its leaving ends
+        # the upstream, and a stream is kept alive meanwhile.
         done = threading.Event()
-        if with_body and body and answered_whole(body):
-            threading.Thread(target=self._watch_client, args=(done,), daemon=True).start()
+        self._wlock = threading.Lock()      # the keeper writes into the stream until _open returns
+        whole = bool(body) and answered_whole(body)
+        keeper = None
+        if body:
+            keeper = threading.Thread(target=self._watch_client if whole else self._keep_waiting,
+                                      args=(done,), daemon=True)
+            keeper.start()
         try:
             resp, herr, cerr = self._open(body)
         finally:
             done.set()                      # headers, or an error: the generation is over
+            if keeper is not None:
+                keeper.join(timeout=CLIENT_IO_S)
+            with self._wlock:               # and nothing is half-written into the stream
+                pass
         if getattr(self, "_caller_left", False):
             # the watch ended the upstream, or the answer raced it: either way nobody is
             # left to answer, and an error here is not the engine's
@@ -2872,12 +3470,35 @@ class H(BaseHTTPRequestHandler):
                 if r is not None:
                     try: r.close()
                     except Exception: pass
-            self._done("CLIENT GONE during non-sse wait"); return
+            self._done("CLIENT GONE during non-sse wait" if whole else "CLIENT GONE before the engine answered")
+            return None
+        silent = getattr(self, "_silent_before_head", None)
+        if silent is not None:
+            for r in (resp, herr):
+                if r is not None:
+                    try: r.close()
+                    except Exception: pass
+            log(f"upstream silent for {silent:.0f}s before its first byte, dropping the request")
+            if getattr(self, "_held_sse", False):
+                if self.path.startswith("/v1/messages"):
+                    try: self._chunk(sse_error(f"upstream silent for {silent:.0f}s, request dropped"))
+                    except Exception: pass
+                self._finish()
+            else:
+                self._answer(504, {"Content-Type": "application/json"},
+                             json.dumps({"error": {"type": "upstream_silent",
+                                                   "message": f"keepalive-proxy: the engine did not answer in {silent:.0f}s"}}).encode())
+            self._done("DROPPED upstream silent"); return None
         if cerr is not None:
             invalidate_pool()           # same: the next pool must be read fresh
-            self._unavailable(cerr); self._done("503 engine unreachable"); return
-        if herr is not None: self._upstream_error(herr); return
+            return ("unreachable", str(cerr), None)
+        if herr is not None and herr.code in (502, 503, 504):
+            try: herr.read(); herr.close()
+            except Exception: pass
+            return ("upstream", f"it answered HTTP {herr.code}, as it does while starting or shutting down", herr.code)
+        if herr is not None: self._upstream_error(herr); return None
         self._relay(resp)
+        return None
 
     def _systemone(self, body):
         """POST /v1/systemone (v6.19): typed decisions, Jev's contract, this lane's model.
@@ -3117,7 +3738,10 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 30001
-    log(f"v6.25 on {BIND}:{port} -> {UPSTREAM} (keepalive {KEEPALIVE_S:.0f}s, max silence {MAX_SILENCE_S:.0f}s)")
+    holds = (f"holds requests up to {HOLD_MAX_S:.0f}s while {' or '.join(HOLD_UNITS)} comes back"
+             if HOLD_UNITS and HOLD_MAX_S > 0 else "holds nothing")
+    # one f-string: the cockpit's tests render this line from the source
+    log(f"v6.32 on {BIND}:{port} -> {UPSTREAM} (keepalive {KEEPALIVE_S:.0f}s, max silence {MAX_SILENCE_S:.0f}s, {holds})")
     if FLASH_PROMPT_CEILING_TOKENS > 0:
         log(f"one-prompt ceiling {FLASH_PROMPT_CEILING_TOKENS} tokens while the flash lane serves"
             + (f", {PROMPT_CEILING_TOKENS} on any lane" if PROMPT_CEILING_TOKENS > 0 else ""))
@@ -3135,6 +3759,11 @@ if __name__ == "__main__":
             ctx.load_cert_chain(TLS_CERT, TLS_KEY or None)
         except Exception as e:
             sys.exit(f"[proxy] refusing to start: certificate {TLS_CERT} is not usable ({e})")
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        # S6: do not handshake in the accept loop. A single silent client could then hold
+        # the whole accept loop for the handshake timeout; every other connection,
+        # including the cockpit's health checks, would queue behind it. The handshake is
+        # done in H.setup, on the connection's own thread and its own budget.
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True,
+                                       do_handshake_on_connect=False)
         log(f"TLS on (cert {TLS_CERT})")
     httpd.serve_forever()

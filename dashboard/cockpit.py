@@ -14,6 +14,7 @@ Then open http://127.0.0.1:30090 and paste the API key from
 from __future__ import annotations
 
 import base64
+import calendar
 import hashlib
 import hmac
 import http.server
@@ -26,11 +27,11 @@ import secrets
 import shutil
 import signal
 import socket
-import socketserver
 import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from collections import deque
@@ -84,6 +85,18 @@ def _release() -> str:
 
 
 VERSION = _release()
+
+
+def installed_release():
+    """The release this checkout is, for the release check: CHANGELOG.md's first heading,
+    read now. The tags were the witness until v1.20.2, and get.sh fetched main and no tag,
+    so a box updated by the one-liner kept naming the release it was first cloned at and
+    was told an update was out for the release it ran (v1.19.0 on the reference box
+    running v1.20.1, 2026-10-01). The tags answer only when the file names no release."""
+    rel = _release()
+    if rel != "unknown":
+        return "v" + rel
+    return run(["git", "-C", str(REPO_DIR), "describe", "--tags", "--abbrev=0"]).strip() or None
 # Dry run: every mutating action and every automatic belt is logged, audited and
 # shown exactly as usual, but nothing is executed. This is how the click-storm test
 # (tests/monkey-check.mjs) exercises the whole UI against a second cockpit instance.
@@ -93,8 +106,8 @@ DRY_RUN = os.environ.get("COCKPIT_DRY_RUN", "0") == "1"
 MASKED_FIELDS = {"api_key", "admin_api_key"}
 
 UNITS = ("qwen38-sglang.service", "qwen38-flash.service", "qwen38-image.service",
-         "qwen38-keepalive.service")
-JOURNAL_UNITS = UNITS + (AGENT_UNIT,)   # what the Logs tab may read (UNITS carries the image lane)
+         "qwen38-video.service", "qwen38-keepalive.service")
+JOURNAL_UNITS = UNITS + (AGENT_UNIT,)   # what the Logs tab may read (UNITS carries the image and video lanes)
 CONTAINERS = ("qwen38-sglang", "qwen38-flash")
 
 UNIT2CONT = {"qwen38-sglang.service": "qwen38-sglang",
@@ -137,9 +150,11 @@ def job_phrase(action: str, params: dict) -> str:
 # offered and the action layer refused, which is a button that errors. install.sh
 # now restarts this unit, but a plain `git pull` does not, so the process watches
 # its own sources and says so instead of lying quietly.
+# The page is several scripts since the rebuild (2026-09-29): every one of them counts,
+# found on disk rather than listed, so a script added later is watched too.
 CODE_FILES = ("cockpit.py", "recipes.py", "lifecycle.py", "registry.py",
-              "agent_relay.py", "image_lab.py", "static/index.html", "static/app.js",
-              "static/image-lab.js")
+              "agent_relay.py", "image_lab.py", "static/image-lab.js", "static/index.html") + tuple(
+    "static/js/" + p.name for p in sorted((HERE / "static" / "js").glob("*.js")))
 
 
 def code_fingerprint() -> dict:
@@ -288,6 +303,8 @@ def controller_request(method: str, path: str, timeout: float = 4.0) -> tuple[in
 
 def controller_27b() -> dict | None:
     """Controller observation for the 27B lane, or None when unavailable."""
+    if DRY_RUN:
+        return None
     try:
         # Qwen's configured readiness probe is /health_generate, which takes
         # about one second by design; a one-second socket timeout races it.
@@ -302,7 +319,7 @@ def controller_27b() -> dict | None:
 
 def controller_manages_27b() -> bool:
     model = controller_27b()
-    return bool(model and model.get("ownership") == "managed")
+    return (CONFIG_DIR / "controller-managed").exists() or bool(model and model.get("ownership") == "managed")
 
 
 # The engine's current routes, and the deprecated ones only on an engine that answers 404 to
@@ -341,7 +358,7 @@ def engine_load(timeout: float = 3.0):
         running, waiting = int(r.get("num_running_reqs") or 0), int(r.get("num_waiting_reqs") or 0)
         total, used = int(r.get("num_total_tokens") or 0), int(r.get("num_used_tokens") or 0)
         rows.append({"dp_rank": r.get("dp_rank", 0), "num_reqs": running + waiting,
-                     "num_waiting_reqs": waiting, "num_tokens": total,
+                     "num_waiting_reqs": waiting, "num_tokens": total, "num_used_tokens": used,
                      "num_pending_tokens": total - used})
     return rows
 
@@ -414,9 +431,11 @@ def collect_gpu():
     q = run(["nvidia-smi", "--query-gpu=power.draw,temperature.gpu",
              "--format=csv,noheader,nounits"]).strip()
     power, temp = (q.split(", ") + ["", ""])[:2] if q else ("", "")
-    procs = []
-    for line in run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
-                     "--format=csv,noheader"]).splitlines():
+    # None when nvidia-smi did not answer: an empty list is a GPU with nothing on it, and the
+    # page said "No process on the GPU" of a query that timed out (found 2026-10-02)
+    apps = run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"])
+    procs = [] if answered(apps) else None
+    for line in apps.splitlines() if procs is not None else []:
         pid, memtxt = [x.strip() for x in line.split(",")][:2]
         name = ""
         try:
@@ -449,6 +468,8 @@ def collect_units():
             since="",
             manager="spark-model-controller",
         )
+    if (CONFIG_DIR / "controller-managed").exists():
+        out["qwen38-sglang.service"]["manager"] = "spark-model-controller"
     return {"node_id": "local", "units": out}
 
 
@@ -571,6 +592,11 @@ def collect_kernel():
     hour: measured 29/08 to precede the livelock edge (prefill of a 150k+ prompt at
     fraction 0.81). Read-only via the sudoers line for journalctl -k."""
     out = run(["sudo", "-n", "/usr/bin/journalctl", "-k", "--since", "-1h", "--no-pager", "-o", "short-iso"], timeout=8)
+    # A read that did not answer is no reading, not a quiet hour: it read "0", and it became
+    # the baseline the next read is measured against, so every refusal of the hour came back
+    # as new after one journalctl that timed out (found 2026-10-02)
+    if not answered(out):
+        return {"node_id": "local", "nvrm_oom_1h": None, "nvrm_last": None}
     lines = [ln for ln in out.splitlines() if "NV_ERR_NO_MEMORY" in ln]
     last = lines[-1].split()[0] if lines else None
     count = len(lines)
@@ -592,7 +618,13 @@ def collect_engine_info():
     # 10 s, not 6: SGLang's event loop stalls under a long prefill and a late answer is
     # far better than none (measured 30/08: three timeouts in a row at 6 s while the same
     # endpoint answered in 0.19 s between two requests).
-    info = engine_server_info(timeout=10)
+    try:
+        info = engine_server_info(timeout=10)
+    except (OSError, http.client.HTTPException) as exc:
+        if HEALTH["ok"]:
+            raise
+        return {"node_id": "local", "info": {}, "served_target": None,
+                "prompt_ceiling_tokens": 0, "unavailable": str(exc)[:120]}
     kept = ("model_path", "served_model_name", "revision", "quantization",
             "context_length", "mem_fraction_static", "max_running_requests",
             "chunked_prefill_size", "speculative_algorithm",
@@ -637,10 +669,25 @@ WEDGED_SINCE: dict = {}
 READY_SINCE: dict = {}          # per unit: when this activation first reached ready
 WEDGE_MIN_READY_S = float(os.environ.get("COCKPIT_WEDGE_MIN_READY_S", "180"))
 LAST_HEAL: dict = {"ts": 0.0}
+# An engine whose server lives on without its scheduler (lifecycle.zombie_plan) is restarted,
+# unlike a wedge: there is nothing to judge, the scheduler is gone, and the start guard
+# (engine-preflight.sh) keeps the restart off memory still held. COCKPIT_ZOMBIE_RESTART=0
+# leaves it to the operator.
+ZOMBIE_RESTART = os.environ.get("COCKPIT_ZOMBIE_RESTART", "1") == "1"
+ZOMBIE_AFTER_S = 120.0
+ZOMBIE_COOLDOWN_S = 1800.0
+ZOMBIE_SINCE: dict = {}
+LAST_ZOMBIE_RESTART: dict = {}
+# A crash while serving goes through the same 15 s between two attempts as a boot that keeps
+# dying, and both read "keeps crashing, it dies during startup" (seen 2026-10-01 after one
+# crash of a serving engine). Per unit: it was serving when it went down this time.
+CRASHED_SERVING: dict = {}
 LAST_PROGRESS: dict = {"ts": None}
 UNHEALTHY_TICKS: dict = {}     # per unit: consecutive ticks with health down
 IMAGE_READY_ENTER: dict = {}   # image lane: the activation (enter timestamp) it served in
 IMAGE_INVOCATION: dict = {}    # image lane: its current systemd invocation, whose journal is its own
+VIDEO_READY_ENTER: dict = {}   # video lane: the activation (enter timestamp) it served in
+VIDEO_INVOCATION: dict = {}    # video lane: its current systemd invocation, whose journal is its own
 BOOT_SEEN: dict = {}           # text lanes: (activation, last boot parse that had evidence)
 BOOT_HEAD_READ: dict = {}      # text lanes: the activation whose first minutes were read once
 POOL_GUARD = os.environ.get("COCKPIT_POOL_GUARD", "1") == "1"
@@ -775,7 +822,13 @@ def _metrics_values(raw: str, name: str) -> dict[str, float]:
 def collect_throughput():
     """Read engine rates and derive separate cached/uncached prefill rates."""
     now = time.time()
-    raw = http_text(ENGINE_BASE + "/metrics", timeout=4)
+    try:
+        raw = http_text(ENGINE_BASE + "/metrics", timeout=4)
+    except (OSError, http.client.HTTPException) as exc:
+        THROUGHPUT.update(ts=None, counters={})
+        THROUGHPUT["recent"].clear()
+        return {"node_id": "local", "available": False, "current": {},
+                "recent_median": {}, "sample_count": 0, "unavailable": str(exc)[:120]}
     generation = _metrics_values(raw, "gen_throughput").get("value")
     counters = _metrics_values(raw, "realtime_tokens_total")
     if not counters:
@@ -805,13 +858,32 @@ def collect_throughput():
     return {"node_id": "local", "current": rates, "recent_median": recent,
             "sample_count": len(THROUGHPUT["recent"])}
 
+FEED_CARRY: list[dict] = []        # requests in flight at the last read, for the next one
+FEED_BOOTED = [False]
+
 
 @guard
 def collect_feed():
-    """Last requests seen by the keepalive proxy: client, path, size, outcome, guard detail."""
-    raw = run(["journalctl", "-u", "qwen38-keepalive.service", "-n", "200",
-               "--no-pager", "-o", "short-iso"], timeout=6)
-    return {"node_id": "local", "rows": lc.parse_feed(raw)}
+    """Last requests seen by the keepalive proxy: client, path, size, outcome, guard detail,
+    and every older request still in flight. The 800 newest journal lines are read every
+    5 s (4,000 cost 0.7 s on the reference box); what was in flight at the last read is
+    carried into the next, so a long generation stays counted after its start leaves the
+    window. The first read goes back to the proxy's start: a cockpit restarted under a long
+    generation saw it nowhere until it ended."""
+    argv = ["journalctl", "-u", "qwen38-keepalive.service", "-n", "800", "--no-pager", "-o", "short-iso"]
+    timeout = 6
+    if not FEED_BOOTED[0]:
+        since = run(["systemctl", "show", "qwen38-keepalive.service", "-p", "ActiveEnterTimestamp",
+                     "--value", "--timestamp=unix"]).strip()
+        if re.fullmatch(r"@\d+", since):
+            argv = ["journalctl", "-u", "qwen38-keepalive.service", "--since", since, "-n", "20000",
+                    "--no-pager", "-o", "short-iso"]
+            timeout = 15
+    raw = run(argv, timeout=timeout)
+    FEED_BOOTED[0] = FEED_BOOTED[0] or answered(raw)      # a read that timed out is tried again
+    rows = lc.parse_feed(raw, carry=FEED_CARRY)
+    FEED_CARRY[:] = [dict(r) for r in rows if r["outcome"] == "in flight"]
+    return {"node_id": "local", "rows": lc.mark_probes(rows, "/v1/systemone", len(SYSTEMONE_PROBE_BODY))}
 
 
 ZOMBIE_WINDOW = "10m"          # one window per sample: no overlap, no double count
@@ -895,7 +967,7 @@ def fit_verdict(ctx: int, outp: int, usable: int, prompt_cap: int, window: int =
 
 
 # Fit opencode's limits once the serving engine has booted, when the ones declared do not
-# fit its pool (maybe_autofit). COCKPIT_AUTOFIT=0 leaves it to the Setup tab's button.
+# fit its pool (maybe_autofit). COCKPIT_AUTOFIT=0 leaves it to the Settings tab's button.
 AUTOFIT = not AGENT_REMOTE and os.environ.get("COCKPIT_AUTOFIT", "1") == "1"
 AUTOFIT_DONE: dict = {}          # text unit -> the activation its limits were fitted in
 _OC_FIT: dict = {}               # oc-fit-limits.py, loaded once for its fit() formula
@@ -915,7 +987,7 @@ def _oc_fit():
 
 def maybe_autofit(fit: dict | None, states: dict, ceiling: int) -> str:
     """Fit opencode's limits to the pool of the engine that has just booted, when the ones
-    declared do not fit it, through the same action as the Setup tab's button.
+    declared do not fit it, through the same action as the Settings tab's button.
 
     A switch writes the target's nominal pair, because the pool is only known once the
     engine is up, and on the 1M lanes that pair's worst case (923,863: the 680,000
@@ -953,7 +1025,7 @@ def maybe_autofit(fit: dict | None, states: dict, ceiling: int) -> str:
     AUTOFIT_DONE[unit] = enter
     add_event("guard", f"opencode limits fitted to the {int(fit['pool']):,}-token pool this boot got: "
                        f"{ctx:,} + {outp:,}, where they asked for {int(fit['worst']):,}; "
-                       f"the Agent tab's server restarts to read them")
+                       f"the Agent view's server restarts to read them")
     return "started"
 
 
@@ -963,7 +1035,7 @@ _OCM: dict = {}
 def jsonc_load(text: str):
     """A config as opencode reads it, comments and trailing commas allowed: with json.loads a
     commented config read as unreadable, and an unreadable one as empty ("none", "not
-    declared") on the Setup tab (found in review, 2026-09-24). The parser is oc-merge-limits',
+    declared") on the Settings tab (found in review, 2026-09-24). The parser is oc-merge-limits',
     the one the installer edits these files with."""
     if "load" not in _OCM:
         try:
@@ -1175,7 +1247,7 @@ def agent_relay_thread():
 
 # ---- "there is a newer release" ---------------------------------------------------
 # The release check existed before this: /api/upstream compared the installed tag against
-# the newest published one, and printed the answer in a line of the Models tab that only
+# the newest published one, and printed the answer in a line of the Library tab that only
 # appears after someone presses a button. Nobody presses a button to discover news they
 # do not know exists, so an install could sit versions behind a fix without one sign of
 # it. This collector asks the same question on a slow tier and hands the answer to the
@@ -1201,10 +1273,7 @@ def _semver(tag):
 def collect_update():
     """{installed, latest, behind, stale_code}. Every field is optional: a box with no
     network, or one that opted out, reports what it knows and claims nothing else."""
-    # CHANGELOG.md is the installed checkout's release marker (also used for VERSION
-    # above). `git describe` can report an old release when a clone has the current
-    # release commit but has not fetched its tag, making the cockpit claim it is behind.
-    out = {"installed": "v" + VERSION if _semver(VERSION) else None}
+    out = {"installed": installed_release()}
     stale = code_is_stale()
     if stale:
         out["stale_code"] = stale
@@ -1303,6 +1372,11 @@ def unit_target(unit: str) -> dict:
         model = _image_unit_flag("--model-path", "Qwen/Qwen-Image-2.1") \
             if IMAGE_UNIT_PATH.exists() else None
         return {"model": model, "target": "image" if model else None}
+    if unit == "qwen38-video.service":
+        # one checkpoint, one target, same rule as the image lane
+        model = _video_unit_flag("--model-path", "MiniMaxAI/MiniMax-H3") \
+            if VIDEO_UNIT_PATH.exists() else None
+        return {"model": model, "target": "video" if model else None}
     path = UNIT_PATHS.get(unit)
     if not path:
         return {"model": None, "target": None}
@@ -1338,6 +1412,40 @@ def monotonic_now() -> float:
     return float(Path("/proc/uptime").read_text().split()[0])
 
 
+# The boot a text lane is expected to take when this box has recorded none of its own
+# (the reference box's medians, as the page's READY_DEFAULT), and the grace after it
+# during which "fired up but not answering" still reads as the warm-up it usually is.
+TEXT_BOOT_DEFAULT_S = {"qwen38-sglang.service": 540.0, "qwen38-flash.service": 780.0}
+WARMUP_GRACE_S = 300.0
+# How long the other sampler tiers wait for the first health sample (start_samplers): the
+# engine is asked /v1/loads then, when idle, /health, 3 s and 4 s at most.
+FIRST_HEALTH_WAIT_S = 10.0
+
+
+def preflight_said(unit: str, invocation: str):
+    """What engine-preflight.sh last wrote in this run of the unit (its journal, not the
+    container's log: while it waits there is no container), or None."""
+    if not invocation:
+        return None
+    return lc.parse_preflight(run(["journalctl", "-u", unit, f"_SYSTEMD_INVOCATION_ID={invocation}",
+                                   "-o", "cat", "--no-pager", "-n", "20", "-g", "preflight: "],
+                                  timeout=5).splitlines())
+
+
+def scheduler_alive(container: str):
+    """True when the engine's container runs its scheduler, False when it runs without it,
+    None when its process list cannot be read (then nothing is decided from it). docker top
+    refuses a field list without the PID ("Couldn't find PID field in ps output"): asked for
+    `comm` alone it never answered, and no zombie was ever seen (the reference box, a real
+    one, 2026-10-01)."""
+    out = run(["docker", "top", container, "-eo", "pid,comm"], timeout=6)
+    rows = [ln.split(None, 1) for ln in str(out).splitlines()[1:]]
+    names = [row[1].strip() for row in rows if len(row) == 2]
+    if not getattr(out, "ok", True) or not names:
+        return None
+    return any(n.startswith("sglang::schedul") for n in names)
+
+
 @guard
 def collect_lifecycle():
     """Explicit per-engine state + progress + ETA + action gates (2s tier)."""
@@ -1359,7 +1467,8 @@ def collect_lifecycle():
             states[unit] = "ready" if active == "active" else "stopped"
             continue
         is_image = unit == lc.IMAGE_UNIT
-        if is_image and not IMAGE_UNIT_PATH.exists():
+        is_video = unit == lc.VIDEO_UNIT
+        if (is_image or is_video) and not (IMAGE_UNIT_PATH.exists() if is_image else VIDEO_UNIT_PATH.exists()):
             continue                    # not installed: no card, no pill, no gate
         controlled = (unit == "qwen38-sglang.service" and managed_27b
                       and managed_27b.get("ownership") == "managed")
@@ -1376,11 +1485,16 @@ def collect_lifecycle():
                 unit, active=active, sub=d.get("SubState", "?"), prev_state=prev.get(unit),
                 enter_key=d.get("ActiveEnterTimestampMonotonic", "0"),
                 invocation=d.get("InvocationID", ""))
+        elif is_video:
+            st, boot, running = video_engine_state(
+                unit, active=active, sub=d.get("SubState", "?"), prev_state=prev.get(unit),
+                enter_key=d.get("ActiveEnterTimestampMonotonic", "0"),
+                invocation=d.get("InvocationID", ""))
         else:
             cont = UNIT2CONT[unit]
             running = bool(run(["docker", "ps", "-q", "-f",
                                 f"name=^{cont}$"]).strip())
-        if not is_image and running and not healthy:
+        if not is_image and not is_video and running and not healthy:
             # A mature server's tail is pure decode noise: only read logs
             # while health is down (boot or trouble), where markers live.
             tail = run(["docker", "logs", "--tail", "300", cont],
@@ -1410,19 +1524,21 @@ def collect_lifecycle():
                 except ValueError:
                     pass
             if boot["stage"] is not None:
+                if seen and seen[0] == activation and seen[1].get("fired_up") and not boot["fired_up"]:
+                    boot = {**boot, "fired_up": True}   # this activation served: it fired up
                 BOOT_SEEN[unit] = (activation, boot)
             elif seen and seen[0] == activation and activation != "0":
                 boot = seen[1]
         # Hysteresis: a 2 s health probe times out under a heavy prefill.
         # Leaving ready needs 3 consecutive misses AND no fresh progress line;
         # a single 200 restores it at once.
-        if is_image:
-            pass                        # its state was derived above, from its own facts
+        if is_image or is_video:
+            pass                        # their state was derived above, from their own facts
         elif healthy:
             UNHEALTHY_TICKS[unit] = 0
         else:
             UNHEALTHY_TICKS[unit] = UNHEALTHY_TICKS.get(unit, 0) + 1
-        if not is_image:
+        if not is_image and not is_video:
             progressing = LAST_PROGRESS["ts"] and time.time() - LAST_PROGRESS["ts"] < 30
             sticky_ready = (prev.get(unit) in ("ready", "wedged") and running and not healthy
                             and (UNHEALTHY_TICKS[unit] < 3 or progressing))
@@ -1434,8 +1550,35 @@ def collect_lifecycle():
             # we had already reached ready in this activation.
             # (wedged is only reachable from ready, so an engine that was wedged has served)
             if st["state"] == "degraded" and prev.get(unit) not in ("ready", "degraded", "wedged"):
-                st["state"] = "warming-up"
-        if st["state"] == "ready" and not is_image:
+                # A cockpit that did not watch this activation start cannot tell "fired up a
+                # moment ago" from "fired up hours ago, not answering since": the second read
+                # "warming up" for as long as it lasted, a boot state, which holds every
+                # switch back. Past the lane's usual boot and a grace, it is the second.
+                with LIFE_LOCK:
+                    watched = LIFE["witnessed"].get(unit, False)
+                age = None
+                try:
+                    mono_us = int(d.get("ActiveEnterTimestampMonotonic") or 0)
+                    if mono_us > 0:
+                        age = monotonic_now() - mono_us / 1e6
+                except ValueError:
+                    pass
+                usual = lc.eta_for(history, unit) or TEXT_BOOT_DEFAULT_S.get(unit, 780.0)
+                if watched or age is None or age <= usual + WARMUP_GRACE_S:
+                    st["state"] = "warming-up"
+            # An activation that served has fired up, whatever the last 300 lines say later.
+            # The cockpit reads the log only while health is down, so the last stage it saw in
+            # a boot it watched was the one before "fired up"; when the engine lost health
+            # later (a zombie under a crash's tracebacks: no milestone left in the window),
+            # that stage came back and the lane read "capturing graphs" instead of "degraded",
+            # which no zombie restart follows (the reference box, 2026-10-01).
+            act = d.get("ActiveEnterTimestampMonotonic", "0")
+            if st["state"] == "ready" and act != "0":
+                seen = BOOT_SEEN.get(unit)
+                was = seen[1] if seen and seen[0] == act else lc.parse_boot_log([])
+                if not was.get("fired_up"):
+                    BOOT_SEEN[unit] = (act, {**was, "fired_up": True})
+        if st["state"] == "ready" and not is_image and not is_video:
             with STATE_LOCK:
                 load = ((STATE.get("engine_fast") or {}).get("data", {})
                         .get("load") or [{}])[0]
@@ -1534,6 +1677,41 @@ def collect_lifecycle():
                     audit({"kind": "autoheal", "unit": unit, "code": code, "out": out})
             else:
                 WEDGED_SINCE.pop(unit, None)
+        if not is_image and not is_video:
+            zp = lc.zombie_plan(state=st["state"],
+                                scheduler_alive=scheduler_alive(UNIT2CONT[unit])
+                                if st["state"] == "degraded" and running else None,
+                                since=ZOMBIE_SINCE.get(unit), now=time.time(), after_s=ZOMBIE_AFTER_S,
+                                enabled=ZOMBIE_RESTART,
+                                cooldown_ok=time.time() - LAST_ZOMBIE_RESTART.get(unit, 0.0) > ZOMBIE_COOLDOWN_S,
+                                job_running=JOB_LOCK.locked())
+            if zp["zombie"]:
+                if ZOMBIE_SINCE.get(unit) is None:
+                    add_event("zombie", f"{unit}: its server answers nothing and its scheduler is gone; "
+                              "nothing restarts that by itself"
+                              + (f", the cockpit does in {ZOMBIE_AFTER_S:.0f} s" if ZOMBIE_RESTART else ""))
+                    audit({"kind": "zombie", "unit": unit})
+                ZOMBIE_SINCE[unit] = zp["since"]
+                st = {**st, "zombie": True, "zombie_in": round(zp["in"])}
+                if zp["restart"]:
+                    LAST_ZOMBIE_RESTART[unit] = time.time()
+                    add_event("zombie", f"{unit}: restarting it (no scheduler for {ZOMBIE_AFTER_S:.0f} s)"
+                              + (" (dry run: not really)" if DRY_RUN else ""))
+                    code, out = start_action("unit", {"verb": "restart", "unit": unit}, origin="zombie")
+                    audit({"kind": "zombie_restart", "unit": unit, "code": code, "out": out})
+            else:
+                ZOMBIE_SINCE.pop(unit, None)
+        if st["state"] == "failed" and st.get("restarting"):
+            if prev.get(unit) in ("ready", "degraded", "wedged"):
+                CRASHED_SERVING[unit] = True
+            if CRASHED_SERVING.get(unit):
+                st = {**st, "crashed_serving": True}
+        elif st["state"] != "failed":
+            CRASHED_SERVING.pop(unit, None)
+        # what the start guard said, when it is why the lane is not up (held, refused)
+        if active in ("activating", "failed"):
+            st = lc.preflight_flags(st, unit_sub=d.get("SubState", "?"),
+                                    preflight=preflight_said(unit, d.get("InvocationID", "")))
         elapsed = None
         try:
             mono_us = int(d.get("ActiveEnterTimestampMonotonic", "0"))
@@ -1572,14 +1750,20 @@ def collect_lifecycle():
                          "stage_done": boot.get("done", []),
                          # which stage list this engine walks, and what it is loading
                          # now: the UI draws each from here rather than assuming
-                         "stages": list(lc.IMAGE_STAGES if is_image else lc.STAGES),
-                         "detail": boot.get("detail", ""),
-                         "kind": "image" if is_image else "text",
+                          "stages": list(lc.VIDEO_STAGES if is_video else lc.IMAGE_STAGES if is_image else lc.STAGES),
+                          "detail": boot.get("detail", ""),
+                          "kind": "video" if is_video else "image" if is_image else "text",
                          # systemd's own word for how the last run ended: "timeout" is a
                          # unit killed because it did not stop in time, not one that crashed
                          "result": d.get("Result", ""),
                          # a crash loop reads failed between attempts; the page says so
                          "restarting": bool(st.get("restarting")),
+                         # the start guard's reason while it holds the start, or once it refused
+                         "held": st.get("held"), "refused": st.get("refused"),
+                         # a server alive without its scheduler, and when the cockpit restarts it
+                         "zombie": bool(st.get("zombie")), "zombie_in": st.get("zombie_in"),
+                         # down between two attempts after it stopped while serving, not at boot
+                         "crashed_serving": bool(st.get("crashed_serving")),
                          "restarts": int(d.get("NRestarts") or 0) if str(d.get("NRestarts", "")).isdigit() else 0,
                          "elapsed": round(elapsed, 1) if elapsed else None,
                          "state_elapsed": round(state_elapsed, 1) if state_elapsed is not None else None,
@@ -1594,9 +1778,9 @@ def collect_lifecycle():
             if st["state"] == "ready" and elapsed and witnessed \
                     and was in lc.TRANSITIONAL:
                 history = lc.record_boot(history, unit, elapsed)
-                if is_image:
-                    # It has no KV pool, and ENGINE_BASE is the text lane's port: reading
-                    # a pool here would record the wrong engine's, or nothing.
+                if is_image or is_video:
+                    # Neither has a KV pool, and ENGINE_BASE is the text lane's port:
+                    # reading a pool here would record the wrong engine's, or nothing.
                     save_history(history)
                     with LIFE_LOCK:
                         LIFE["witnessed"][unit] = False
@@ -1696,6 +1880,7 @@ STATE["config"] = {"data": {"usable_frac": USABLE_FRAC, "version": VERSION, "dry
                             # the page says what happens to a wedged engine, and on a default
                             # install that is nothing: it promised the belt's restart regardless
                             "autoheal": AUTOHEAL, "autoheal_grace_s": AUTOHEAL_GRACE,
+                            "zombie_restart": ZOMBIE_RESTART,
                             "terminal_only": {"update_stack": f"cd {REPO_DIR} && ./install.sh",
                                               "install_agent": f"cd {REPO_DIR} && dashboard/install-agent.sh"}},
                    "ts": time.time()}
@@ -1727,10 +1912,11 @@ def sampler(period: float, collectors: dict):
 AUDIT_LOG = CONFIG_DIR / "cockpit-audit.log"
 
 # The image lane is here because a cockpit whose Image tab tells you to open a terminal
-# is not a cockpit. Starting it stops the text lane (the unit's own Conflicts=), which is
-# why the modal says so before it runs.
+# is not a cockpit, and the video lane for the same reason. Starting either stops the
+# text lane (each unit's own Conflicts=), which is why the modal says so before it runs.
 SERVING_UNITS = {"qwen38-sglang.service", "qwen38-flash.service",
-                 "qwen38-keepalive.service", "qwen38-image.service"}
+                 "qwen38-keepalive.service", "qwen38-image.service",
+                 "qwen38-video.service"}
 if not AGENT_REMOTE:
     SERVING_UNITS.add(AGENT_UNIT)
 UNIT_VERBS = {"start", "stop", "restart"}
@@ -1748,7 +1934,7 @@ ACTIONS = {
     "switch": {
         "danger": "medium",
         "params": {"target": ["stock", "uncensored", "fp8", "uncensored-fp8",
-                              "flash", "flash-nvda", "flash-uncensored", "image"]},
+                              "flash", "flash-nvda", "flash-uncensored", "image", "video"]},
         "argv": lambda p: ["bash", str(REPO_DIR / "switch-model.sh"), p["target"]],
         # A switch can download a whole checkpoint: 124 GB for flash take about 23 min at
         # the 89 MB/s the reference box gets, so 30 min failed it on any slower link, and
@@ -1765,7 +1951,7 @@ ACTIONS = {
     },
     # NOTE: no "update_stack" here. install.sh needs an interactive sudo (units, cp,
     # sed) that a service without a tty cannot give; a half-applied install from a
-    # button is the one failure this cockpit must never cause. The Setup tab shows
+    # button is the one failure this cockpit must never cause. The Settings tab shows
     # the exact terminal command instead (STATE config: terminal_only).
     # abort every in-flight generation (orphans left by vanished clients)
     "abort_all": {
@@ -1983,13 +2169,15 @@ def served_model_name() -> str:
     return "qwen3.8-27b"
 
 
-# ---- System One (local Jev), the tab that exercises POST /v1/systemone ------------
+# ---- System One (local Jev): the Decide view exercises POST /v1/systemone ----------
 # The cockpit talks to the proxy, never to the browser's own origin: the serving key
 # stays on this machine and no page ever holds it. Everything here is one call to
 # PROXY_BASE, with the same key job_smoke() uses.
 SYSTEMONE_CACHE = {"data": None, "ts": 0.0}
 SYSTEMONE_LOCK = threading.Lock()
 SYSTEMONE_MAX_STATE = 48_000        # the cockpit's own POST cap is 64 KiB for every route
+# the availability probe: no state, so the proxy refuses it at the schema and no model runs
+SYSTEMONE_PROBE_BODY = json.dumps({"model": "jev-latest", "questions": {}}).encode()
 
 
 def systemone_available(max_age: float = 60.0) -> dict:
@@ -2021,8 +2209,7 @@ def systemone_available(max_age: float = 60.0) -> dict:
             SYSTEMONE_CACHE.update(data=out, ts=time.time(), key=key)
             return out
         out = {"available": False, "lane": key[1], "reason": "", "status": None}
-        body = json.dumps({"model": "jev-latest", "questions": {}}).encode()
-        req = urllib.request.Request(PROXY_BASE + "/v1/systemone", body,
+        req = urllib.request.Request(PROXY_BASE + "/v1/systemone", SYSTEMONE_PROBE_BODY,
                                      {"Content-Type": "application/json",
                                       "Authorization": f"Bearer {api_key()}"})
         try:
@@ -2327,10 +2514,38 @@ IMAGE_ALLOWED = {"prompt", "width", "height", "num_inference_steps", "n", "outpu
 IMAGE_EDIT_UNREAD = ("flow_shift", "max_sequence_length")
 
 
+LIFE_UNKNOWN = (None, None)
+
+
+def _run_over(life: tuple, life0: tuple) -> bool:
+    """Did the run of the lane this request went to end? Silence is NOT an answer
+    (found in the branch's concurrency review, 2026-09-28): run() swallows a systemd
+    that takes more than five seconds, and comparing tuples directly read that mute
+    ("", "") as the lane being gone, answered "the lane was stopped" while it was
+    generating, and gave the lock back beside a live job. A "deactivating" carrying
+    the run's own InvocationID does answer here, and answers "stop": this runtime
+    cancels its jobs as it stops (measured: seven stops in ten days, each done in
+    under a second, the runtime's shutdown cancels the generation tasks)."""
+    if life == life0 or life == LIFE_UNKNOWN:
+        return False
+    if life0 == LIFE_UNKNOWN:
+        return life[0] in ("inactive", "failed", "")
+    # A request in flight sees its run active; deactivating is a stop answering
+    # (this runtime cancels the job as it stops, measured), activating can only be
+    # a new run rising after the old one died or was stopped (a clean stop shows
+    # inactive first, and the restart's crash verdict belongs to _video_cut's
+    # SubState check), inactive/failed is a unit that ended, and any different
+    # InvocationID is a different run whatever its state's name.
+    return (life[0] in ("inactive", "failed", "deactivating", "activating")
+            or life[1] != life0[1])
+
+
 def _image_life() -> tuple:
     """(ActiveState, InvocationID) of the image unit, asked of systemd directly: the
     lifecycle ticks every 2 s, and the question is whether THIS request outlived its lane."""
     raw = run(["systemctl", "show", IMAGE_UNIT, "-p", "ActiveState,InvocationID"], timeout=5)
+    if not answered(raw):
+        return LIFE_UNKNOWN
     d = dict(ln.split("=", 1) for ln in raw.splitlines() if "=" in ln)
     return d.get("ActiveState", ""), d.get("InvocationID", "")
 
@@ -2406,7 +2621,7 @@ def _release_image_lock_when_done(life0: tuple, since: float) -> None:
     deadline = time.time() + IMAGE_TIMEOUT
     try:
         while time.time() < deadline:
-            if _image_life() != life0 or _image_request_ended_since(life0[1], since):
+            if _run_over(_image_life(), life0) or _image_request_ended_since(life0[1], since):
                 return
             time.sleep(IMAGE_END_POLL_S)
     finally:
@@ -2494,7 +2709,7 @@ def image_call(payload: dict, editing: bool) -> tuple[int, dict]:
         # A Stop or a restart cancels the request in flight after 5 s, and uvicorn answers
         # that with a bare 500. Whoever sent the stop (this page, another tab, a terminal),
         # the answer is the same fact, so it is told here and not guessed by one client.
-        if e.code >= 500 and _image_life() != life0:
+        if e.code >= 500 and _run_over(_image_life(), life0):
             return _image_cut(t0)
         try:
             detail = json.loads(raw.decode())
@@ -2502,7 +2717,7 @@ def image_call(payload: dict, editing: bool) -> tuple[int, dict]:
             detail = raw[:400].decode("utf-8", "replace")
         return e.code, {"refused": detail, "seconds": round(time.time() - t0, 2)}
     except Exception as e:                              # noqa: BLE001 (isolated route)
-        if _image_life() != life0:
+        if _run_over(_image_life(), life0):
             return _image_cut(t0)
         if isinstance(e, TimeoutError):
             # A read timeout: the request reached this same run and this process stopped
@@ -2514,7 +2729,7 @@ def image_call(payload: dict, editing: bool) -> tuple[int, dict]:
             handed_over[0] = True
             return 504, {"error": IMAGE_STILL_RUNNING, "seconds": round(time.time() - t0, 2)}
         return 502, {"error": f"the image lane did not answer ({type(e).__name__}). "
-                              f"Switch to Qwen-Image 2.1 in the action bar and start it "
+                              f"Load Qwen-Image 2.1 from the Lanes view to start it "
                               f"(or ./switch-model.sh image)",
                      "seconds": round(time.time() - t0, 2)}
     finally:
@@ -2536,6 +2751,690 @@ def _multipart(fields: dict, images: list) -> tuple[bytes, str]:
         out += raw + b"\r\n"
     out += f"--{boundary}--\r\n".encode()
     return bytes(out), f"multipart/form-data; boundary={boundary}"
+
+
+# ── the video lane ──────────────────────────────────────────────────────────────
+# MiniMax-H3, served by SGLang Diffusion in its own venv on its own port, installed
+# by ./install.sh --with-video. Same shape as the image lane: the browser never holds
+# the serving key (the diffusion runtime has none) and never talks to the lane; it
+# sends a description of the call and this process makes it.
+#
+# One difference from images: creation is asynchronous. POST /v1/videos answers 200
+# with an id in a queued state, the lane works for minutes, and GET /v1/videos/{id}
+# (polled here through the list) says when it is completed. So this process holds
+# the call from the create to the download, the way the image call holds one from
+# the POST to the pixels.
+VIDEO_UNIT = "qwen38-video.service"
+VIDEO_UNIT_PATH = Path("/etc/systemd/system/qwen38-video.service")
+# A prompt plus two keyframes at most; the MP4 itself travels back as a download,
+# never inside a JSON body.
+VIDEO_MAX_POST = 10 * 1024 * 1024
+# The download the other way has no such cap in the route: a lane answering a
+# gigabyte would park it whole in this process's RAM, on unified memory shared
+# with the GPU. Legal calls return tens of megabytes; past a gigabyte it is
+# abuse or corruption, refused before or during the read (review, 2026-09-29).
+VIDEO_CONTENT_MAX_BYTES = 1 << 30
+# About 12 min per 4 s 480P request on the reference box, plus the queue ahead of it
+# and the download after: a call past this stops waiting here, not on the lane (which
+# has no abort and goes on). 60 min covers the cookbook shapes at 480P; a legal 720P
+# call at 50 steps outruns it (7.65 s per step-second) and goes 504 plus hand-off.
+# The cookbook's duration band is 4 to 15 s.
+VIDEO_TIMEOUT = 3600.0
+# This lane serves ONE request at a time. Measured 2026-09-29: a second call sent to the
+# lane while one runs waits in its queue and starts when the first ends (no overlap, no
+# memory stacked: 9.6 GB then 8.3 GB), so the lock costs nothing the lane would give,
+# and it lets this cockpit refuse at once and say why instead of holding a second call.
+VIDEO_LOCK = threading.Lock()
+# The sizes and lengths measured on this box, past which a call is refused (video_call):
+# above 864x480 pixels a video is admitted at 4 s only.
+VIDEO_LONG_MAX_PIXELS = 864 * 480
+VIDEO_LARGE_MAX_SECONDS = 4
+VIDEO_POLL_S = 10.0
+VIDEO_LAST: dict = {}             # the call in flight or just finished: {id, status, seconds}
+
+
+VIDEO_UNIT_CACHE: dict = {}
+
+
+def _video_unit_text() -> str:
+    """The unit's text, read once per mtime: the lifecycle tick, the status call and
+    the tab's poll each ask for the port, the bind, the model and the variant, several
+    times a second between them. Empty when the unit is absent or unreadable."""
+    try:
+        key = (str(VIDEO_UNIT_PATH), VIDEO_UNIT_PATH.stat().st_mtime_ns)
+    except OSError:
+        return ""
+    hit = VIDEO_UNIT_CACHE.get("unit")
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        text = VIDEO_UNIT_PATH.read_text(errors="replace")
+    except OSError:
+        return ""
+    VIDEO_UNIT_CACHE["unit"] = (key, text)
+    return text
+
+
+def _video_unit_flag(flag: str, fallback: str) -> str:
+    """What the installed unit passes, not what this file assumes. Only real
+    directives count: a comment naming the flag must not win, and a flag left
+    with no value must fall back instead of raising (review, 2026-09-29)."""
+    for line in _video_unit_text().splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if flag in text:
+            parts = text.split(flag, 1)[1].split()
+            if parts:
+                return parts[0]
+    return fallback
+
+
+def video_port() -> int:
+    try:
+        return int(_video_unit_flag("--port", "30022"))
+    except ValueError:
+        return 30022
+
+
+def video_base() -> str:
+    host = _video_unit_flag("--host", "127.0.0.1")
+    return os.environ.get("COCKPIT_VIDEO", f"http://{host}:{video_port()}")
+
+
+VIDEO_JOURNAL_LINES = 300
+# The first lines of a run hold every boot marker: the server line, the component loads,
+# FastAPI's start (line 74 of the reference box's boot, 2026-09-30).
+VIDEO_HEAD_LINES = 600
+# unit -> (invocation, boot): the stage a boot reached, kept for that activation, and the
+# invocation whose first lines were read once
+VIDEO_BOOT_SEEN: dict = {}
+VIDEO_HEAD_READ: dict = {}
+
+
+def _video_journal(invocation: str, head: bool = False) -> list:
+    """This run's log, and only this run's: the lines of the unit's current systemd
+    invocation. Same latest-boot trap as the image lane: a new process takes seconds
+    to print its first line, and until it does the tail is the previous run's.
+    head=True reads the run from its start instead of its tail (the boot's markers)."""
+    if not invocation:
+        return []
+    if head:
+        raw = run(["journalctl", f"_SYSTEMD_INVOCATION_ID={invocation}",
+                   "--no-pager", "-o", "cat"], timeout=15.0)
+        return raw.splitlines()[:VIDEO_HEAD_LINES]
+    raw = run(["journalctl", f"_SYSTEMD_INVOCATION_ID={invocation}",
+               "-n", str(VIDEO_JOURNAL_LINES), "--no-pager", "-o", "cat"], timeout=8.0)
+    return raw.splitlines()
+
+
+def video_healthy() -> bool:
+    """The video lane's own /health, on its own port. Only a 200 is ready."""
+    try:
+        urllib.request.urlopen(urllib.request.Request(video_base() + "/health"),
+                               timeout=3).read()
+        return True
+    except Exception:                                   # noqa: BLE001 (any non-200 is "not yet")
+        return False
+
+
+def video_engine_state(unit: str, *, active: str, sub: str, prev_state: str | None,
+                       enter_key: str, invocation: str = "") -> tuple:
+    """(state, boot, running) for the video lane, from its own facts: the unit, its own
+    /health, and its journal while it boots. None of the text lanes' belts apply to it
+    (pool guard, generation canary, autoheal): they all talk to ENGINE_BASE.
+
+    Same one-miss-keeps-ready rule as the image lane: once the lane has served in this
+    activation it does not go back to booting on a slow probe."""
+    running = active in ("active", "activating")
+    healthy = running and video_healthy()
+    VIDEO_INVOCATION[unit] = invocation
+    UNHEALTHY_TICKS[unit] = 0 if healthy else UNHEALTHY_TICKS.get(unit, 0) + 1
+    served_here = VIDEO_READY_ENTER.get(unit) == enter_key and enter_key != "0"
+    boot = {"stage": None, "fired_up": False, "done": []}
+    if running and not healthy:
+        if served_here:
+            boot = {"stage": "warming-up", "fired_up": True, "done": list(lc.VIDEO_STAGES)}
+            healthy = UNHEALTHY_TICKS[unit] < 3
+        else:
+            boot = lc.parse_video_boot_log(_video_journal(invocation))
+            # The tail is 300 lines and the cockpit's own /health probe writes one every
+            # 2 s through the warm-up: its markers leave the window before it ends (the
+            # reference box, 2026-09-30: FastAPI's start at line 74 of 395), the parse
+            # reads no stage, and the lane went from warming up back to starting. Within
+            # one activation a boot does not go back; a cockpit that came up after the
+            # markers left reads the run's first lines, once.
+            seen = VIDEO_BOOT_SEEN.get(unit)
+            if (boot["stage"] is None and invocation and not (seen and seen[0] == invocation)
+                    and VIDEO_HEAD_READ.get(unit) != invocation):
+                VIDEO_HEAD_READ[unit] = invocation
+                boot = lc.parse_video_boot_log(_video_journal(invocation, head=True))
+            if boot["stage"] is not None:
+                VIDEO_BOOT_SEEN[unit] = (invocation, boot)
+            elif seen and invocation and seen[0] == invocation:
+                boot = seen[1]
+    st = lc.derive_state(unit_active=active, unit_sub=sub, container_running=running,
+                         healthy=healthy, boot=boot)
+    if st["state"] == "degraded" and prev_state not in ("ready", "degraded"):
+        st["state"] = "warming-up"
+    if st["state"] == "ready":
+        VIDEO_READY_ENTER[unit] = enter_key
+    return st, boot, running
+
+
+# The lines lc.parse_video_run reads. The journal is filtered before it is tailed: the
+# cockpit's own /health probe writes a line every 2 s, and in a 45-minute request those
+# push the stage lines out of any plain tail of the unit.
+VIDEO_RUN_GREP = (r"Stage\] (started|finished)|denoise:|Pixel data|Running pipeline"
+                  r"|Error executing|Failed to generate")
+
+
+def video_run_now() -> dict:
+    """The phase and the step of the request the lane is working on, {} when none.
+    journalctl hands a filtered tail back newest first, so the rows are put back in time
+    order by their own timestamps before they are read (measured 2026-09-29)."""
+    inv = VIDEO_INVOCATION.get(VIDEO_UNIT, "")
+    if not inv:
+        return {}
+    raw = run(["journalctl", f"_SYSTEMD_INVOCATION_ID={inv}", "--grep", VIDEO_RUN_GREP,
+               "-n", "60", "--no-pager", "-o", "json", "--output-fields=MESSAGE"], timeout=8.0)
+    rows = []
+    for line in raw.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        msg = e.get("MESSAGE") if isinstance(e, dict) else None
+        if isinstance(msg, list):          # journald stores a message with a \r as bytes
+            try:
+                msg = bytes(msg).decode("utf-8", "replace")
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(msg, str):
+            continue
+        try:
+            ts = int(e.get("__REALTIME_TIMESTAMP", 0))
+        except (TypeError, ValueError):
+            ts = 0
+        rows.append((ts, msg))
+    rows.sort(key=lambda r: r[0])
+    return lc.parse_video_run([m for _, m in rows])
+
+
+def video_status() -> dict:
+    """What the Video tab needs that the lifecycle does not already carry: where the
+    lane listens, which model and variant its unit serves, and the call in flight."""
+    out = {"installed": VIDEO_UNIT_PATH.exists(), "port": video_port(),
+           "host": _video_unit_flag("--host", "127.0.0.1"),
+           "model": _video_unit_flag("--model-path", "MiniMaxAI/MiniMax-H3"),
+           "variant": _video_unit_flag("--model-variant", "fl2va"),
+           "state": "not installed", "available": False, "llm_lane": "", "progress": {}, "run": {}}
+    if not out["installed"]:
+        return out
+    with LIFE_LOCK:
+        states = dict(LIFE.get("states", {}))
+    # before the lifecycle's first tick (a cockpit that just started) nothing is known
+    # yet, and saying so beats guessing "stopped" at a lane that may be serving
+    out["state"] = states.get(VIDEO_UNIT) or "unknown"
+    out["available"] = out["state"] in ("ready", "degraded")
+    out["llm_lane"] = next((u for u in lc.TEXT_UNITS if states.get(u) in lc.BUSY_STATES), "")
+    if out["available"]:
+        out["progress"] = dict(VIDEO_LAST) if VIDEO_LAST.get("status") not in ("completed", "failed", "") else {}
+        out["run"] = video_run_now()
+    return out
+
+
+def _video_life() -> tuple:
+    """(ActiveState, InvocationID) of the video unit, asked of systemd directly: the
+    lifecycle ticks every 2 s, and the question is whether THIS request outlived its lane."""
+    raw = run(["systemctl", "show", VIDEO_UNIT, "-p", "ActiveState,InvocationID"], timeout=5)
+    if not answered(raw):
+        return LIFE_UNKNOWN
+    d = dict(ln.split("=", 1) for ln in raw.splitlines() if "=" in ln)
+    return d.get("ActiveState", ""), d.get("InvocationID", "")
+
+
+VIDEO_INTERRUPTED = ("the video lane was stopped or restarted while this video was being made, which is "
+                     "the only way this runtime can end a generation early (it has no abort); nothing was kept")
+VIDEO_CRASHED = ("the video lane crashed while this video was being made (systemd: {result}), and nothing "
+                 "was kept. Its journal, in the Logs tab, says why; systemd starts it again by itself.")
+# How a run that ended under a request ended: same rule as the image lane.
+VIDEO_CRASH_RESULTS = {"signal", "core-dump", "oom-kill", "watchdog"}
+
+
+def _video_exit() -> dict:
+    """SubState and Result of the video unit, asked of systemd once a request was cut."""
+    raw = run(["systemctl", "show", VIDEO_UNIT, "-p", "SubState,Result,NRestarts"], timeout=5)
+    return dict(ln.split("=", 1) for ln in raw.splitlines() if "=" in ln)
+
+
+def _video_cut(t0: float) -> tuple[int, dict]:
+    """The answer for a request whose run of the lane ended under it."""
+    ex = _video_exit()
+    secs = round(time.time() - t0, 2)
+    if not ex:
+        # systemd said nothing at all: the clean stop the 503 names cannot be
+        # proven, so read it as the crash it may be (review, 2026-09-29).
+        return 502, {"error": VIDEO_CRASHED.format(result="systemd answered nothing"),
+                     "crashed": True, "seconds": secs}
+    if ex.get("SubState") == "auto-restart" or ex.get("Result") in VIDEO_CRASH_RESULTS:
+        return 502, {"error": VIDEO_CRASHED.format(result=ex.get("Result") or "died"), "crashed": True,
+                     "seconds": secs}
+    return 503, {"error": VIDEO_INTERRUPTED, "interrupted": True, "seconds": secs}
+VIDEO_STILL_RUNNING = ("the video lane is still generating this request: it has no abort, so it goes on after "
+                       "this page stopped waiting, and the next request is refused until it ends, or at worst "
+                       "after one more hour in the background, after which this page may say idle while the "
+                       "lane still works. Cancel restarts the lane if it should not finish.")
+
+
+def _video_decoded_frame(payload: dict, name: str) -> tuple[bytes | None, str]:
+    """One keyframe data URL, as bytes. Absent is fine (text-only); malformed is refused."""
+    ref = payload.get(name)
+    if ref is None:
+        return None, ""
+    if not isinstance(ref, str) or not ref.startswith("data:image/"):
+        return None, f"{name} is not an image data URL"
+    head, _, b64 = ref.partition(",")
+    if ";base64" not in head or not b64:
+        return None, f"{name} is not base64"
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:                               # noqa: BLE001
+        return None, f"{name} is not valid base64"
+    if not raw:
+        return None, f"{name} is empty"
+    return raw, ""
+
+
+# Only what this model accepts, and nothing that lets a browser reach past the lane.
+VIDEO_ALLOWED = {"model", "prompt", "seconds", "size", "task", "target", "quality",
+                 "num_outputs_per_prompt", "num_inference_steps", "flow_shift",
+                 "audio_flow_shift", "seed"}
+
+
+# What counts as finished on the lane's list: anything else found there is a
+# generation in flight, including a status this cockpit has never seen (a new
+# lane version must refuse, not double-book).
+_VIDEO_DONE = ("completed", "failed", "error", "cancelled", "missing")
+
+
+def _video_lane_busy() -> bool:
+    """Is another generation already on the lane? The lock is per-process: it
+    cannot see a generation an older cockpit left behind, so admission asks the
+    lane itself. Silence is not an answer here either: a down lane holds no
+    jobs, and the create and poll paths already handle a lane that says nothing
+    (found in review, 2026-09-29: a cockpit restart orphaned a queued job the
+    sweep then deleted, and the new process happily generated beside it)."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(video_base() + "/v1/videos"),
+                                    timeout=20) as r:
+            items = json.loads(r.read().decode()).get("data", [])
+    except Exception:                               # noqa: BLE001 (lane down: nothing alive)
+        return False
+    return any(v.get("status", "unknown") not in _VIDEO_DONE for v in items)
+
+
+def _video_list_entry(vid: str) -> tuple:
+    """This video's (status, progress) from the lane's list. Progress is the lane's
+    own 0-100, or None when the lane says nothing ("unknown") or nothing about this
+    video ("missing")."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(video_base() + "/v1/videos"),
+                                    timeout=20) as r:
+            items = json.loads(r.read().decode()).get("data", [])
+    except Exception:                               # noqa: BLE001 (the poll below retries)
+        return "unknown", None
+    for v in items:
+        if v.get("id") == vid:
+            return v.get("status", "unknown"), v.get("progress")
+    return "missing", None
+
+
+def _release_video_lock_when_done(life0: tuple, vid: str, timeout: float,
+                                 staged: list = ()) -> None:
+    """The lock of a call that timed out here, given back when the lane is done with
+    it: the video reached a terminal status, or the lane is no longer the run the call
+    went to (a Cancel, a Stop, a crash), or the timeout went by with neither. "missing"
+    counts as terminal here too, exactly as the synchronous poll reads it: a gone
+    record is a finished one, and waiting on it would spend the clock for nothing.
+    The staged keyframes travel with the lock because the lane reads their pixels at
+    the pipeline's start, not at the POST: a queued job that outlived this call still
+    has their file:// URIs in hand, and unlinking on hand-off would fail it later
+    (found in review, 2026-09-28)."""
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            if _run_over(_video_life(), life0):
+                return
+            st, progress = _video_list_entry(vid)
+            # The parked page reads VIDEO_LAST: without these two writes the
+            # progress bar and the status freeze at the hand-off minute until
+            # the watcher clears them, up to an hour later (review, 2026-09-29).
+            VIDEO_LAST["status"] = st
+            if isinstance(progress, (int, float)):
+                VIDEO_LAST["progress"] = progress
+            if st in ("completed", "failed", "error", "cancelled", "missing"):
+                return
+            time.sleep(VIDEO_POLL_S)
+    finally:
+        for path in staged:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        VIDEO_LAST.clear()
+        VIDEO_LOCK.release()
+
+
+def video_call(payload: dict) -> tuple[int, dict]:
+    """One video request, made to the lane on loopback and waited on to the end. This
+    process is the gate: the route checked the session before the body was read."""
+    fields = {k: v for k, v in payload.items() if k in VIDEO_ALLOWED and v is not None}
+    if not str(fields.get("prompt", "")).strip():
+        return 400, {"error": "a prompt is required"}
+    secs = fields.get("seconds", 5)
+    if isinstance(secs, bool) or not isinstance(secs, int) or not 4 <= secs <= 15:
+        # the cookbook's duration band: 4 to 15 s
+        return 400, {"error": "seconds is a whole number from 4 to 15"}
+    fields["seconds"] = secs
+    if "seed" in fields and not re.fullmatch(r"\d+", str(fields["seed"])):
+        if fields["seed"] != "":
+            # the page refuses the rest first, but an API call is not the page: a
+            # seed the lane would read as random must not ride out silently
+            # (found in review, 2026-09-29).
+            return 400, {"error": "seed is a whole number, or empty for a random one"}
+        del fields["seed"]
+    steps = fields.get("num_inference_steps")
+    if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= 100):
+        # same bound the image lane enforces: past it a call outlives the timeout
+        # and pins the single-flight GPU lane for nothing
+        return 400, {"error": "num_inference_steps is a number from 1 to 100"}
+    if fields.get("num_outputs_per_prompt", 1) != 1:
+        # the lane serves one request at a time; parallel variants inside one call are
+        # the same working set twice
+        return 400, {"error": "one video per call on this lane; make several calls"}
+    fields["num_outputs_per_prompt"] = 1
+    size = fields.get("size")
+    if size is not None:
+        parts = str(size).lower().replace(" ", "").split("x")
+        try:
+            sw, sh = (int(parts[0]), int(parts[1])) if len(parts) == 2 else (0, 0)
+        except ValueError:
+            sw = sh = 0
+        if sw <= 0 or sh <= 0:
+            return 400, {"error": "size must be WIDTHxHEIGHT, two positive numbers"}
+    else:
+        sw, sh = 864, 480
+    # The lane requires a target object (measured 2026-09-25): short edge, aspect
+    # ratio and duration, derived from the size and seconds above so the tab's two
+    # controls stay the contract. The ratio is the cookbook's wording ("16:9"), which
+    # the lane accepted with 864x480 and served to completed: the exact reduction
+    # (18:10) was never tried against it.
+    fields["size"] = f"{sw}x{sh}"
+    # The lane was only ever served and measured at 16:9 and 9:16; a square or 4:3
+    # size here would declare the ratio it is not, and cost unknown pixels.
+    ratio = sw / sh
+    if abs(ratio - 16 / 9) > 0.05 * (16 / 9) and abs(ratio - 9 / 16) > 0.05 * (9 / 16):
+        return 400, {"error": "size must be 16:9 or 9:16, the two canvases this lane was "
+                              "measured on; give a matching WIDTHxHEIGHT like 864x480"}
+    if sw * sh > 1280 * 720:
+        # The image lane has IMAGE_MAX_PIXELS for the same reason: past what was
+        # measured, the cost is a guess and the memory is a certain risk - 1280x704
+        # already peaks at 81.9 GB of this box's 121.6.
+        return 400, {"error": f"{sw}x{sh} is past the largest canvas measured here "
+                              "(1280x720, which peaks at 81.9 GB of 121.6)"}
+    # The memory a video takes grows much faster than its length, and only what was
+    # measured is admitted: 480P from 4 to 15 s (4 s peaked at 9.6 GB, 15 s at 78.3 GB,
+    # 2026-09-29) and 720P at 4 s (82 GB at its peak, 2026-09-25). A 720P video of 8 s
+    # was admitted by the time budget alone, and on this box's 121.6 GB it cannot fit:
+    # running out of unified memory hangs the machine, which is a power cycle by hand.
+    if sw * sh > VIDEO_LONG_MAX_PIXELS and secs > VIDEO_LARGE_MAX_SECONDS:
+        return 400, {"error": f"{sw}x{sh} is measured here at {VIDEO_LARGE_MAX_SECONDS} s only (82 GB at its "
+                              f"peak, of 121.6): a {secs} s video at this size would outgrow the box's "
+                              "memory, which hangs it. Ask for 4 s at this size, or up to 15 s at 480P."}
+    fields["target"] = {"short_edge": min(sw, sh),
+                        "aspect_ratio": "16:9" if sw >= sh else "9:16",
+                        "duration_seconds": secs}
+    # Budget at admission, the way the image lane budgets pixels (IMAGE_MAX_PIXELS,
+    # measured on this box). Cost is linear in step-seconds at the two sizes measured
+    # here: 4 s 480P at the 50-step default in 592 s (2.96 s per step-second, rounded
+    # up to 3.05 with the 9 s text encode and the 27 s decode folded in) and 4 s 720P
+    # at about 50 steps in about 25 min (7.65, against a measured 7.43, same margin);
+    # keyframe conditioning measured about a minute on a 4 s 480P video, ~10 %,
+    # applied below.
+    # A call estimated past the lock's whole guard (one hour of waiting here plus the
+    # hour the hand-off watcher holds on) would free the lock while the lane still
+    # works, and a second call beside the first is the pair that hangs this box
+    # (measured on this runtime with images: two generations held 90.5 GB of 121.6
+    # and wedged the engine). So the estimate is refused at the door, not discovered
+    # at the 120th minute. The view carries the same numbers (vidEtaSecs,
+    # dashboard/static/js/video.js) and dashboard/tests/test_video_routes.py holds them equal.
+    per_step = 3.05 if sw * sh <= 864 * 480 else 7.65
+    conditioning = bool(payload.get("first_frame") or payload.get("last_frame"))
+    est = per_step * (steps or 50) * secs * (1.1 if conditioning else 1.0)
+    # 7200 s, not 2 * VIDEO_TIMEOUT: this budget is wall-clock work on the GPU, and
+    # the tests' patched VIDEO_TIMEOUT is a clock shortcut, not a shorter box. The
+    # tenth kept in hand: the estimate is a prediction and the lock's deadline is
+    # wall-clock, and a call accepted at the ceiling would free the lock on a few
+    # percent of drift alone (the per-step numbers ride on one measured run each).
+    # Measured drift needs no third digit, so this slack asks nothing of 480P.
+    if est * 1.1 > 2 * 3600.0:
+        return 400, {"error": f"about {round(est / 60)} min at {secs} s, {sw}x{sh} and {steps or 50} steps: "
+                              "no slack under the two hours this cockpit holds the call, and the next one "
+                              "could start beside this one. Ask for fewer steps, a shorter video, or 480P."}
+    # Keyframes turn text-to-video into first/last-frame conditioning; without them the
+    # call is text only. Reference modes (ref2va weights) need a unit installed with
+    # VIDEO_VARIANT=ref2va and are refused here until that lane exists.
+    first, why = _video_decoded_frame(payload, "first_frame")
+    if why:
+        return 400, {"error": why}
+    last, why = _video_decoded_frame(payload, "last_frame")
+    if why:
+        return 400, {"error": why}
+    variant = _video_unit_flag("--model-variant", "fl2va")
+    keyframe_paths: list = []
+    if first is not None or last is not None:
+        if variant != "fl2va":
+            return 400, {"error": f"this lane serves the {variant} weights, which take no keyframes"}
+        # The lane reads keyframes by URI, not by bytes: decoded frames are staged as
+        # files this user owns and named file://, then removed with the call. Data URLs
+        # are never sent: whether the pipeline accepts one was never measured.
+        import tempfile
+        try:
+            for raw, tag in ((first, "first"), (last, "last")):
+                if raw is None:
+                    continue
+                fd, path = tempfile.mkstemp(prefix=f"qwen38-{tag}-frame-", suffix=".png",
+                                            dir=str(CONFIG_DIR))
+                # Named before it is filled: a write that dies half-way (ENOSPC) must
+                # leave no PNG behind either (found in review, 2026-09-28).
+                keyframe_paths.append(path)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+        except OSError as e:
+            for path in keyframe_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            return 503, {"error": f"the cockpit could not stage the keyframe on disk ({e.strerror}); "
+                                  "nothing was sent to the lane"}
+        try:
+            fields["task"] = "fl2va"
+            fields["conditions"] = []
+            if first is not None:
+                fields["conditions"].append({"type": "image",
+                                             "uri": f"file://{keyframe_paths[0]}",
+                                             "role": "keyframe", "frame_index": 0})
+            if last is not None:
+                fields["conditions"].append({"type": "image",
+                                             "uri": f"file://{keyframe_paths[-1]}",
+                                             "role": "keyframe", "frame_index": -1})
+        except Exception:
+            for path in keyframe_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise
+    else:
+        # The lane requires a task; named wrong it answers 400 (measured 2026-09-25).
+        # Text-only is t2va, and only t2va: fl2va without a frame would read as text-only
+        # under a conditioning task, so it is refused as asked, not served as text.
+        task = fields.get("task", "t2va")
+        if task not in ("t2va", "fl2va"):
+            return 400, {"error": "task is t2va, or fl2va with a first_frame and/or last_frame"}
+        if task == "fl2va":
+            if variant != "fl2va":
+                return 400, {"error": f"this lane serves the {variant} weights, which take no keyframes"}
+            return 400, {"error": "fl2va names first/last-frame conditioning: attach a first_frame and/or last_frame"}
+        fields["task"] = "t2va"
+    fields.setdefault("model", "MiniMax-H3")
+    # No Authorization header: the diffusion runtime has no --api-key, so the lane
+    # cannot check one and the unit binds loopback instead. The gate is this process's
+    # own session.
+    if not VIDEO_LOCK.acquire(blocking=False):
+        # The finally below belongs to the try that has not started yet: a refused
+        # call must leave no keyframe behind either, or every retry of a busy lane
+        # quietly piles two PNGs in the config dir (the image lane stages after
+        # acquiring, which is why it never had this hole).
+        for path in keyframe_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return 409, {"error": "this lane serves one video at a time, and something is "
+                              "already generating on it. Wait for the current one to finish."}
+    t0 = time.time()
+    life0 = _video_life()
+    handed_over = [False]
+    if _video_lane_busy():
+        # Not ours: the lock is per-process, so a generation an older cockpit
+        # left behind (restart, crash) is invisible to the acquire above. Asking
+        # the lane keeps two generations from ever running beside each other.
+        for path in keyframe_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        VIDEO_LOCK.release()
+        return 409, {"error": "the lane is already generating a video left behind "
+                              "by an earlier call. Wait for it to finish."}
+    try:
+        req = urllib.request.Request(video_base() + "/v1/videos",
+                                     json.dumps(fields).encode(),
+                                     {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                created = json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            if e.code >= 500 and _run_over(_video_life(), life0):
+                return _video_cut(t0)
+            try:
+                detail = json.loads(raw.decode())
+            except Exception:                           # noqa: BLE001
+                detail = raw[:400].decode("utf-8", "replace")
+            return e.code, {"refused": detail, "seconds": round(time.time() - t0, 2)}
+        vid = created.get("id", "")
+        if not vid:
+            return 502, {"error": f"the lane took the call but gave no video id: {str(created)[:200]}",
+                         "seconds": round(time.time() - t0, 2)}
+        VIDEO_LAST.update({"id": vid, "status": created.get("status", "queued"),
+                           "seconds": 0.0, "progress": created.get("progress", 0)})
+        # To completed, the way the lane reports it: its list, not its journal.
+        while time.time() - t0 < VIDEO_TIMEOUT:
+            if _run_over(_video_life(), life0):
+                return _video_cut(t0)
+            st, progress = _video_list_entry(vid)
+            VIDEO_LAST["status"] = st
+            VIDEO_LAST["seconds"] = round(time.time() - t0, 2)
+            if isinstance(progress, (int, float)):
+                VIDEO_LAST["progress"] = progress
+            if st == "completed":
+                return 200, {"video_id": vid, "seconds": round(time.time() - t0, 2)}
+            if st in ("failed", "error", "cancelled"):
+                return 502, {"error": f"the lane ended video {vid} in {st}",
+                             "seconds": round(time.time() - t0, 2)}
+            if st == "missing":
+                # a definitive answer from the lane, not a transport failure: the
+                # record is gone, so there is nothing to download however long this
+                # waits (an "unknown" is our failure to ask, and polls on)
+                return 502, {"error": f"the lane has no record of video {vid}",
+                             "seconds": round(time.time() - t0, 2)}
+            time.sleep(VIDEO_POLL_S)
+        # The wait ran out; the lane goes on (it has no abort). The lock is handed to
+        # a watcher that gives it back when the lane is done, so a second generation
+        # never runs beside the first.
+        watcher = threading.Thread(target=_release_video_lock_when_done,
+                                   args=(life0, vid, VIDEO_TIMEOUT, keyframe_paths), daemon=True)
+        # The flag goes up before start(): a lane that dies this second could run the
+        # watcher's finally before an assignment placed after start() lands, and a
+        # thread that never started must leave the flag down so this call's own
+        # finally releases (an OS that cannot start threads is the outer except's 502).
+        handed_over[0] = True
+        try:
+            watcher.start()
+        except Exception:
+            handed_over[0] = False
+            raise
+        return 504, {"error": VIDEO_STILL_RUNNING, "video_id": vid,
+                     "seconds": round(time.time() - t0, 2)}
+    except Exception as e:                              # noqa: BLE001 (isolated route)
+        if _run_over(_video_life(), life0):
+            return _video_cut(t0)
+        if life0[0] in ("active", "activating"):
+            # Up and silent for the minute: still in its warm-up (three warm-up requests,
+            # about 10 min after the load) or busy. The only advice here was to start a
+            # lane that was already running (measured 2026-09-29: an 80 s wait, then that).
+            return 503, {"error": f"the video lane is running but did not answer within a minute "
+                                  f"({type(e).__name__}): it is still warming up (three warm-up "
+                                  f"requests, about 10 min after it loads) or busy. Try again when "
+                                  f"the Video tab says it is ready; if the lane took this call after "
+                                  f"all, it runs, and the next call waits for it",
+                         "seconds": round(time.time() - t0, 2)}
+        return 502, {"error": f"the video lane did not answer ({type(e).__name__}). "
+                              f"Load MiniMax-H3 from the Lanes view to start it "
+                              f"(or ./switch-model.sh video)",
+                     "seconds": round(time.time() - t0, 2)}
+    finally:
+        # On a hand-off the keyframes stay: a queued job still holds their file://
+        # URIs, and the watcher removes them when the lane is done with the video.
+        # A cockpit killed before that moment leaves them behind; the boot sweep
+        # removes what belongs to no call.
+        if not handed_over[0]:
+            for path in keyframe_paths:
+                try:
+                    os.unlink(path)
+                except (OSError, NameError):
+                    pass
+            VIDEO_LAST.clear()
+            VIDEO_LOCK.release()
+
+
+def video_content(vid: str) -> tuple[int, bytes, str]:
+    """This video's bytes, downloaded from the lane on loopback. The route checked the
+    session; the id is path-shaped and nothing else reaches the lane."""
+    if not vid or not all(c.isalnum() or c in "-_" for c in vid):
+        return 400, b"", ""
+    try:
+        req = urllib.request.Request(video_base() + f"/v1/videos/{vid}/content")
+        with urllib.request.urlopen(req, timeout=300) as r:
+            declared = r.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    if int(declared) > VIDEO_CONTENT_MAX_BYTES:
+                        return 413, b"", ""
+                except ValueError:
+                    pass
+            data = r.read(VIDEO_CONTENT_MAX_BYTES + 1)
+            if len(data) > VIDEO_CONTENT_MAX_BYTES:
+                return 413, b"", ""
+            return 200, data, r.headers.get("Content-Type", "video/mp4")
+    except urllib.error.HTTPError as e:
+        return e.code, b"", ""
+    except Exception:                                   # noqa: BLE001 (isolated route)
+        return 502, b"", ""
 
 
 def job_flush_cache(job: Job):
@@ -2612,6 +3511,7 @@ def job_diag_bundle(job: Job):
         # the image lane and the Agent tab's server have journals of their own, which the
         # bundle left out (found in review, 2026-09-24)
         (tdp / "journal-image.txt").write_text(run(["journalctl", "-u", IMAGE_UNIT, "-n", "300", "--no-pager", "-o", "short-iso"], timeout=15))
+        (tdp / "journal-video.txt").write_text(run(["journalctl", "-u", VIDEO_UNIT, "-n", "300", "--no-pager", "-o", "short-iso"], timeout=15))
         (tdp / "journal-opencode-web.txt").write_text(run(["journalctl", "-u", AGENT_UNIT, "-n", "200", "--no-pager", "-o", "short-iso"], timeout=15))
         for cont in CONTAINERS:
             (tdp / f"docker-{cont}.txt").write_text(run(["docker", "logs", "--tail", "600", cont], timeout=15, merge_err=True))
@@ -2676,6 +3576,11 @@ def start_action(name: str, params: dict, origin: str = "ui") -> tuple[int, dict
                        "add the target to its registry before switching"]
             audit({"kind": "action_blocked", "action": name,
                    "params": clean, "reasons": reasons})
+            return 409, {"error": "blocked", "reasons": reasons}
+        if (name == "unit" and clean["unit"] in ("qwen38-flash.service", "qwen38-image.service", "qwen38-video.service")
+                and controller_manages_27b()):
+            reasons = ["GPU workload lifecycle is owned by spark-model-controller; use its registry"]
+            audit({"kind": "action_blocked", "action": name, "params": clean, "reasons": reasons})
             return 409, {"error": "blocked", "reasons": reasons}
         reasons = lc.blocked_reasons(name, clean, states)
         if reasons:
@@ -2770,8 +3675,7 @@ def upstream_snapshot(max_age: float = 3600.0) -> dict:
                 row["status"] = "offline"
                 row["detail"] = str(e)[:80]
             rows.append(row)
-        rel = {"local": run(["git", "-C", str(REPO_DIR), "describe",
-                             "--tags", "--abbrev=0"]).strip()}
+        rel = {"local": installed_release() or ""}
         try:
             j = _get_json("https://api.github.com/repos/hasso5703/"
                           "dgx-spark-qwen38/releases/latest")
@@ -2913,6 +3817,75 @@ def check_token(tok: str, kind: str, max_age: int = SESSION_MAX_AGE) -> bool:
         return False
 
 
+
+# The Logs view's lines carry the engine's own time: the serving containers run in UTC, and
+# their lines read two hours behind every other time on the page in Luxembourg (16:37 shown
+# at 18:37, 2026-10-02). Each line's instant comes from its transport, docker's
+# --timestamps or the journal's __REALTIME_TIMESTAMP, and a leading [YYYY-MM-DD HH:MM:SS]
+# that is that instant written in UTC is rewritten in this box's local time. A stamp that
+# is not (local already, a lane that runs natively, another time quoted in the line) stays
+# as it was: what is compared is the instant, so no time zone of the container is assumed.
+_DOCKER_TS = re.compile(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z (.*)$")
+_APP_TS = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\]")
+LOG_STAMP_SLACK_S = 300     # a line's stamp and its transport's instant: well under 1 s apart
+
+
+def docker_log_entries(txt):
+    """[(instant or None, line)] from `docker logs --timestamps`, which puts the instant
+    docker received each line, in UTC, before it. A line with no such prefix (docker's own
+    error) comes back whole, with no instant."""
+    out = []
+    for ln in txt.splitlines():
+        m = _DOCKER_TS.match(ln)
+        out.append((calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")), m.group(2))
+                   if m else (None, ln))
+    return out
+
+
+def journal_log_entries(txt):
+    """[(instant or None, line)] from `journalctl -o json`: every line of an entry's MESSAGE
+    shares the entry's instant. A MESSAGE the journal stored as bytes (not UTF-8) is decoded
+    with replacement; a line that is not an entry comes back whole, with no instant."""
+    out = []
+    for ln in txt.splitlines():
+        try:
+            e = json.loads(ln)
+        except ValueError:
+            e = None
+        if not isinstance(e, dict):
+            out.append((None, ln))
+            continue
+        msg = e.get("MESSAGE")
+        if isinstance(msg, list):
+            try:
+                msg = bytes(msg).decode("utf-8", "replace")
+            except (TypeError, ValueError):
+                msg = None
+        if not isinstance(msg, str):
+            continue
+        try:
+            at = int(e.get("__REALTIME_TIMESTAMP")) / 1e6
+        except (TypeError, ValueError):
+            at = None
+        out.extend((at, part) for part in (msg.splitlines() or [""]))
+    return out
+
+
+def local_log_stamp(line, at):
+    """(line, rewritten): its leading [YYYY-MM-DD HH:MM:SS] in this box's local time, when
+    that stamp is the line's own instant `at` written in UTC; otherwise the line as it was."""
+    m = _APP_TS.match(line) if at is not None else None
+    if not m:
+        return line, False
+    try:
+        stamped = calendar.timegm(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return line, False
+    if abs(stamped - at) > LOG_STAMP_SLACK_S:
+        return line, False
+    local = "[" + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamped)) + "]"
+    return local + line[m.end():], local != m.group(0)
+
 # ── HTTP layer ───────────────────────────────────────────────────────────────
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "SparkCockpit/" + VERSION
@@ -2946,6 +3919,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def send_json(self, obj, code=200):
         return self.send_json_text(json.dumps(obj), code)
+
+    def _linger(self, idle_s=2.0, total_s=10.0):
+        """After an answer sent before the request's body was read: end our side, then read
+        and drop what the client is still sending, for a while. Closed at once, the socket
+        answered that data with a reset, which a client that stops at its failed write met
+        before the answer: a broken pipe five times in five instead of the 413 or the 401
+        (found 2026-10-02; the proxy does the same since 2026-09-24)."""
+        try:
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+            self.connection.settimeout(idle_s)
+            end = time.time() + total_s
+            while time.time() < end and self.connection.recv(65536):
+                pass
+        except OSError:
+            pass
+
+    def send_bytes(self, body: bytes, ctype: str, code=200):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.security_headers()
+        self.end_headers()
+        self.wfile.write(body)
 
     def send_json_text(self, text, code=200):
         body = text.encode()
@@ -3021,21 +4019,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/logs/"):
             name = path.rsplit("/", 1)[1]
             if name in CONTAINERS:
-                txt = run(["docker", "logs", "--tail", "120", name],
-                          timeout=8, merge_err=True)
+                entries = docker_log_entries(run(["docker", "logs", "--timestamps", "--tail", "120", name],
+                                                 timeout=8, merge_err=True))
             elif name in JOURNAL_UNITS:
-                txt = run(["journalctl", "-u", name, "-n", "120",
-                           "--no-pager", "-o", "cat"], timeout=8)
+                entries = journal_log_entries(run(["journalctl", "-u", name, "-n", "120", "--no-pager",
+                                                   "-o", "json", "--all", "--output-fields=MESSAGE"], timeout=8))
             else:
                 return self.send_json({"error": "unknown source"}, 404)
             # The key's value, masked as the bundle masks it: SGLang prints its ServerArgs at
             # boot, 'api_key' included, and for the first minutes of a boot that line was in
             # what this tab showed (found in review, 2026-09-24).
+            # The video lane's container logs in colour and the journal keeps the escape
+            # bytes; in a <pre> they are noise (QA of the live page, 2026-09-28). Stripped
+            # BEFORE the key is masked: a key printed across two colour runs is split by
+            # the escapes, and masking first would let the strip weld the halves back into
+            # a whole key (found by the branch's security review the same day).
+            # The stamp is read once the escapes are gone (a coloured line starts with one),
+            # and the key is masked last, on the whole text, as before.
+            lines, local = [], 0
+            for at, ln in entries:
+                ln, rewritten = local_log_stamp(re.sub(r"\x1b\[[0-?;]*[@-~]", "", ln), at)
+                lines.append(ln)
+                local += rewritten
+            txt = "\n".join(lines)
             key = api_key()
             if key:
                 txt = txt.replace(key, "<masked>")
-            return self.send_json({"name": name,
-                                   "lines": txt.splitlines()[-120:]})
+            return self.send_json({"name": name, "lines": txt.splitlines()[-120:],
+                                   "local_stamps": local, "tz": time.strftime("%Z")})
         if path.startswith("/api/jobs/"):
             job = JOBS.get(path.rsplit("/", 1)[1])
             if not job:
@@ -3045,6 +4056,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send_json(systemone_available(max_age=0.0 if fresh else 60.0))
         if path == "/api/image":
             return self.send_json(image_status())
+        if path == "/api/video":
+            return self.send_json(video_status())
+        if path == "/api/video/content":
+            vid = urllib.parse.parse_qs(query).get("id", [""])[0].strip()
+            code, body, ctype = video_content(vid)
+            if code != 200:
+                return self.send_json({"error": "no such video"}, code)
+            return self.send_bytes(body, ctype or "video/mp4")
         if path == "/api/stream":
             return self.stream()
         return self.send_json({"error": "not found"}, 404)
@@ -3061,21 +4080,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         declared = (self.headers.get("Content-Length") or "0").strip()
         if not (declared.isascii() and declared.isdigit()):
             self.close_connection = True
-            return self.send_json({"error": "bad Content-Length"}, 400)
+            self.send_json({"error": "bad Content-Length"}, 400)
+            return self._linger()
         length = int(declared)
-        # Ten reference images do not fit in 64 KiB and never will. The cap is raised for
-        # the two image routes and for nothing else; a login is a key in a JSON object.
+        # Ten reference images do not fit in 64 KiB and never will; two keyframes of
+        # a prompt fit in 10 MiB, which is what the video route's cap is for (found
+        # in review, 2026-09-28: it used to ride the image lane's 40 MiB through a
+        # max()). The cap is raised for these routes and for nothing else; a login
+        # is a key in a JSON object.
         raised = path in ("/api/image/edit", "/api/image/generate")
-        cap = IMAGE_MAX_POST if raised else 4096 if path == "/api/login" else 65536
+        video = path == "/api/video/generate"
+        cap = IMAGE_MAX_POST if raised else VIDEO_MAX_POST if video else 4096 if path == "/api/login" else 65536
         if length > cap:
             self.close_connection = True
-            return self.send_json({"error": "body too large"}, 413)
+            self.send_json({"error": "body too large"}, 413)
+            return self._linger()
         # Authenticate BEFORE reading the body, on every route but the login: a body is
         # read only for someone who may send one. Checked on the raised-cap routes alone,
         # the others read up to 64 KiB for anyone first (found in review, 2026-09-24).
         if path != "/api/login" and not self.authed():
             self.close_connection = True
-            return self.send_json({"error": "auth"}, 401)
+            self.send_json({"error": "auth"}, 401)
+            return self._linger()
         raw = self.rfile.read(length) if length else b""
         if path == "/api/login":
             # Rate limit: after 5 failures from one address, lock 60 s. The attempt is counted
@@ -3149,6 +4175,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path in ("/api/image/generate", "/api/image/edit"):
             code, out = image_call(payload, editing=path.endswith("edit"))
             return self.send_json(out, code)
+        if path == "/api/video/generate":
+            code, out = video_call(payload)
+            return self.send_json(out, code)
         return self.send_json({"error": "not found"}, 404)
 
     # ---- helpers ----
@@ -3205,12 +4234,58 @@ class Server(ar.BoundedThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def _sweep_staged_frames() -> None:
+    """A cockpit killed mid-call leaves that call's staged keyframes behind, and no
+    hand-off watcher outlives the process that made it. But the lane outlives a
+    cockpit restart, and a job still queued there names its staged files: sweeping
+    blind would fail it. So the sweep stands down while the lane shows a live job
+    (a down lane holds none), and the admission check above refuses new calls
+    until that job is done (found in review, 2026-09-29)."""
+    if _video_lane_busy():
+        return
+    for stale in CONFIG_DIR.glob("qwen38-*-frame-*.png"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def start_samplers(tiers=None, first="engine_fast", wait_s=None, spawn=None) -> None:
+    """One sampler thread per tier, the tier that samples engine health first.
+
+    The lifecycle tier derives every engine's state from that health. Started together,
+    its first pass ran before the first health sample existed, read "no sample yet" as
+    "unhealthy", drew a serving engine as warming up, and logged a "warming-up -> ready"
+    two seconds after every cockpit restart (five in the event log of 2026-09-29/30). The
+    other tiers now start once that sample is in, or after wait_s, from a thread of their
+    own: the HTTP server does not wait for them."""
+    tiers = TIERS if tiers is None else tiers
+    wait_s = FIRST_HEALTH_WAIT_S if wait_s is None else wait_s
+    spawn = spawn or (lambda period, cols: threading.Thread(target=sampler, args=(period, cols),
+                                                            daemon=True).start())
+    head = [t for t in tiers if first in t[1]]
+    rest = [t for t in tiers if first not in t[1]]
+    for period, cols in head:
+        spawn(period, cols)
+
+    def _rest():
+        deadline = time.time() + wait_s
+        while head and time.time() < deadline:
+            with STATE_LOCK:
+                if first in STATE:
+                    break
+            time.sleep(0.05)
+        for period, cols in rest:
+            spawn(period, cols)
+    threading.Thread(target=_rest, daemon=True).start()
+
+
 def main():
     load_events()
+    _sweep_staged_frames()
     if not shutil.which("nvidia-smi"):
         print("note: nvidia-smi not found, GPU panel will degrade")
-    for period, cols in TIERS:
-        threading.Thread(target=sampler, args=(period, cols), daemon=True).start()
+    start_samplers()
     if AGENT_PORT > 0:
         threading.Thread(target=agent_relay_thread, daemon=True).start()
     srv = Server((BIND, PORT), Handler)

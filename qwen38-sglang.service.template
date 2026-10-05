@@ -7,14 +7,17 @@ Requires=docker.service
 # directions (Conflicts= alone orders nothing; measured with throwaway units on the
 # reference box's systemd 255, 2026-09-24). Until v1.18.7 only the image lane said so,
 # and two text lanes could run side by side, or both start at boot if both were enabled.
-Conflicts=qwen38-flash.service qwen38-image.service qwen38-llamacpp.service
-After=network-online.target docker.service qwen38-flash.service qwen38-image.service qwen38-llamacpp.service
+Conflicts=qwen38-flash.service qwen38-image.service qwen38-video.service qwen38-llamacpp.service
+After=network-online.target docker.service qwen38-flash.service qwen38-image.service qwen38-video.service qwen38-llamacpp.service
 
 [Service]
 Type=simple
 User=__USER__
 Group=__GROUP__
 ExecStartPre=-/usr/bin/docker rm -f qwen38-sglang
+# The memory the last engine held has to be back before this one starts: a start piled on
+# memory the driver kept is how sglang#40948 froze a DGX Spark (see engine-preflight.sh).
+ExecStartPre=/bin/bash __HOME__/.config/qwen38/engine-preflight.sh qwen38-sglang.service
 # The key goes to the server in a file SGLang merges in memory (see engine-secrets.sh),
 # written again before every start, so it is on no command line.
 ExecStartPre=/bin/bash __HOME__/.config/qwen38/engine-secrets.sh

@@ -6,6 +6,11 @@
 # Prerequisite (one time): ./install.sh --no-service   (image, checkpoints, key, template)
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# A controller handoff is persistent: never fall back to legacy service ownership.
+if [ "${1:-}" != "--help" ] && [ "${1:-}" != "-h" ] && [ -f "$REPO_DIR/controller-ownership.py" ]; then
+  python3 "$REPO_DIR/controller-ownership.py" || exit 1
+fi
+
 die() { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ── Same pins as install.sh (read from it: single source of truth) ──

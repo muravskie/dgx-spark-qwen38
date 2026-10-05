@@ -2,6 +2,13 @@
 
 How a 176B hybrid MoE serves on a single GB10, the three serving tiers, and what each one measured on this box. Moved out of the README in v1.14.2.
 
+Since v1.20 every plain install puts this lane on the box: beside the 27B, installed and not
+enabled at boot, ready for the cockpit's Load, by the same installer started again for this
+lane (its target and tier are kept across updates), and proved once with a boot and a real
+generation when it is new. `MODEL_CHOICE=flash` makes it the lane that serves instead, with
+the 27B installed beside it; `--no-flash` leaves it out of a 27B box (203 GB), and later runs
+remember that.
+
 > **v1.7 and earlier users: upgrade.** v1.8 replaces this repo's vendored
 > overlay with the official image the SGLang cookbook points DGX Spark at, which
 > fixes at the root the failure the v1.6 proxy could only detect (every running
@@ -67,17 +74,21 @@ silently caps `--max-running-requests` to what the mamba pool admits while
 
 | `FLASH_TIER=` | requests | KV pool | measured here |
 |---|---|---|---|
-| **`context`** (default) | 4 | **279,872 to 463,488 tokens** across boots, and every one of them above the 262,144-token window, so a full-context prompt always fits | **47.9 / 47.1 / 30.9 tok/s** single stream (code, math, prose FR), **71.6 tok/s aggregate at 4 streams** (17.9-18.7 each) |
-| `concurrency` | 8 | **468,480 tokens** measured 2026-09-12 with replayssm-spec (was 129,792 before it), so a full 262K prompt fits at 8 requests too | **43.7 / 44.2 / 29.5 tok/s** single stream (code, reasoning, prose FR, warmed, uncensored), **90.4 tok/s aggregate at 4 streams**, needle 8/8 exact to 140K at 13.5 GiB floor |
+| `context` | 4 | **279,872 to 463,488 tokens** across boots, and every one of them above the 262,144-token window, so a full-context prompt always fits | **47.9 / 47.1 / 30.9 tok/s** single stream (code, math, prose FR), **71.6 tok/s aggregate at 4 streams** (17.9-18.7 each) |
+| **`concurrency`** (default since 2026-09-30) | 8, 2 states per path | **477,056 tokens** measured 2026-09-29 with the per-path cap (468,480 without it, 129,792 before replayssm-spec), so a full 262K prompt fits at 8 requests too | **43.7 / 44.2 / 29.5 tok/s** single stream (code, reasoning, prose FR, warmed, uncensored), **90.4 tok/s aggregate at 4 streams**, needle 8/8 exact to 140K at 13.5 GiB floor |
 | `throughput` | 24, no speculation | ~286K tokens (upstream) | upstream: 83 tok/s of output at 24, 15.9 single |
 
 Both speculative tiers are the cookbook's own verified single-Spark cells, which
-score **GSM8K 97.1-97.3% on the full 1,319-question set** upstream. `context` stays
-this repo's default after measuring 8 requests too: the 8-request pool came out
-larger than the 4-request pool used to (replayssm-spec frees the draft depth
-out of the state budget), but the per-session limits that make long agent
-sessions work (205K/32K) are sized for one or two streams, and concurrent-load
-memory is not measured yet. Same cell, concurrency pinned lower, longer sessions.
+score **GSM8K 97.1-97.3% on the full 1,319-question set** upstream. `concurrency`
+became the default on 2026-09-30 with `--mamba-max-states-per-path 2` added,
+after the campaign measured it on this box (memory flash_palier8_nightly_2026_09_29:
+canaries 4/4, needle 120k/200k 2/2, prefix cache 99.5 to 99.9% on repeated
+prefixes, the pool never saturated, mamba peaked at 22 of 40). The per-path cap
+halves the state each speculative path holds, which is what makes 8 requests fit
+in 40 slots while a full 262K prompt still fits. `context` stays one
+`FLASH_TIER=context ./install.sh` away, and a re-run keeps the tier already
+installed, in both directions (the detection now reads a 4-request launcher
+too, which the old default never needed).
 
 The pool is still sized from what the host has free at the instant SGLang
 profiles, so it is a range rather than a number: boots of the identical launcher
@@ -87,6 +98,44 @@ removed is the *creeping* half of that variance (the table's resident set), not
 the boot-time half, which is why the launcher still waits for a busy box to go
 quiet before it starts. At this tier both ends of the range are above the
 262,144-token window, which is the property that matters.
+
+## Several agents at once: their contexts share one pool
+
+The tier caps how many requests run together; the pool caps how much context they hold
+between them, and with agents that is the limit reached first. An agent keeps its whole
+conversation in the prefix cache from one turn to the next, which is why a turn costs only
+its new tokens (99.5 to 99.9% of a repeated prefix comes from the cache). When the agents'
+contexts add up to more than the pool, each turn evicts another agent's prefix, and that
+agent's next turn computes its whole prompt again.
+
+Measured on 2026-10-03 at the `concurrency` tier, pool 437,184 tokens: an opencode session
+that started eight sub-agents at once. Each sub-agent's first request held about 28,500
+tokens there (opencode's system prompt, that box's tools and the task), and every file it
+read added to it; at 01:00 the eight held 66,103 to 116,159 tokens each, 771,301 in all
+(opencode's own count, in its database). The
+engine's counters, per half hour:
+
+| | 00:15-00:45 | 00:45-01:15 | 01:15-02:15 |
+|---|---|---|---|
+| prompt tokens served from the cache | 94.5% | 50.5% | 27.6% |
+| prompt tokens computed | 303/s | 1,074/s | 1,041 to 1,320/s |
+| tokens decoded, all requests together | 69.3/s | 15.7/s | 2.9 to 3.0/s |
+| requests running (mean, max) | 5.5, 8 | 4.1, 6 | 3.0 to 3.5, 5 |
+
+The rest of that night was another failure, fixed in v1.22.5: requests waited in the queue
+past opencode's 300 s wait for headers, opencode sent them again, and from 02:15 to 11:36
+the engine computed 47,939,516 prompt tokens and decoded 18,807: prompts for callers that
+had already gone (CHANGELOG, v1.22.5). The proxy now keeps such a stream open and ends the
+request of a caller that leaves. What the table shows is left, and it is arithmetic, not a
+bug.
+
+**Keep the sum of the agents' contexts under the pool.** The pool of the running boot is on
+the cockpit's Lanes page (and in the engine's log, `max_total_num_tokens`). An agent that
+reads a lot of files reaches 100,000 to 140,000 tokens (that night's eight peaked at 66,103
+to 142,638), and opencode's compaction keeps each agent under the lane's limit (205,000
+here), not their sum. On a 437,184-token pool that is three or four such agents at once,
+and two at their full limit. More agents still run, but each of their turns costs a whole
+prefill, at about 1,000 to 1,500 tokens a second.
 
 Measured on the reference box at the `context` tier, image
 `dev-qwen38-next-local` (`4ccff141db`):
